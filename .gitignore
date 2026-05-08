@@ -1,3 +1,6 @@
 runs/2026-05-07_2017.jsonl
 hydra/__pycache__/
 runs/yesterday.jsonl
+hydra_best.json
+hydra_candidate.json
+runs/2026-05-08_0621.jsonl

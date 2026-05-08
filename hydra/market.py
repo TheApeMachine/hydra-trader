@@ -540,7 +540,7 @@ class MarketStore:
         move_pct = (last / first_price - 1.0) if first_price > 0 else 0.0
         sp = self.spread_bps_unlocked(symbol)
         book_imb = self.book_imbalance_unlocked(symbol, 5)
-        max_spread = 10.0 if symbol in ("BTC/USD", "ETH/USD") else 16.0
+        max_spread = 10.0 if symbol in ("BTC/USD", "ETH/USD") else 150.0
         return {
             "trades": len(dq),
             "buy_not": buy_not,

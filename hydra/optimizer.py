@@ -146,7 +146,7 @@ class OptunaController:
     @staticmethod
     def _score(metrics: dict[str, Any], cfg: Config) -> float:
         trades = metrics.get("trades", 0)
-        if trades < 4:
+        if trades < 2:
             return -8.0
         ret = metrics.get("net_return", 0.0)
         rph = metrics.get("return_per_hour", 0.0)
@@ -204,20 +204,20 @@ class OptunaController:
 
     def _sample_config(self, trial, base: Config) -> Config:
         cfg = dataclasses.replace(base)
-        cfg.micro_min_trades = trial.suggest_int("micro_min_trades", 10, 30)
-        cfg.micro_min_buy_notional = trial.suggest_float("micro_min_buy_notional", 25_000, 200_000, log=True)
-        cfg.micro_burst_multiple = trial.suggest_float("micro_burst_multiple", 3.0, 10.0)
-        cfg.micro_min_imbalance = trial.suggest_float("micro_min_imbalance", 1.5, 6.0)
+        cfg.micro_min_trades = trial.suggest_int("micro_min_trades", 5, 20)
+        cfg.micro_min_buy_notional = trial.suggest_float("micro_min_buy_notional", 2_000, 50_000, log=True)
+        cfg.micro_burst_multiple = trial.suggest_float("micro_burst_multiple", 2.0, 8.0)
+        cfg.micro_min_imbalance = trial.suggest_float("micro_min_imbalance", 1.2, 5.0)
         cfg.micro_min_move_pct = trial.suggest_float("micro_min_move_pct", 0.003, 0.015)
         cfg.micro_cooldown_sec = trial.suggest_float("micro_cooldown_sec", 30.0, 240.0)
         cfg.micro_candidate_cooldown_sec = trial.suggest_float("micro_candidate_cooldown_sec", 2.0, 8.0)
         cfg.micro_accel_threshold = trial.suggest_float("micro_accel_threshold", 1.0, 3.5)
         cfg.micro_delta_divergence = trial.suggest_float("micro_delta_divergence", 0.7, 2.8)
 
-        cfg.macro_min_tape_trades = trial.suggest_int("macro_min_tape_trades", 4, 18)
-        cfg.macro_min_tape_notional = trial.suggest_float("macro_min_tape_notional", 5_000, 80_000, log=True)
+        cfg.macro_min_tape_trades = trial.suggest_int("macro_min_tape_trades", 3, 15)
+        cfg.macro_min_tape_notional = trial.suggest_float("macro_min_tape_notional", 1_000, 30_000, log=True)
         cfg.macro_min_tape_buy_share = trial.suggest_float("macro_min_tape_buy_share", 0.50, 0.68)
-        cfg.macro_max_spread_bps = trial.suggest_float("macro_max_spread_bps", 8.0, 35.0)
+        cfg.macro_max_spread_bps = trial.suggest_float("macro_max_spread_bps", 10.0, 150.0)
         cfg.macro_min_book_imbalance = trial.suggest_float("macro_min_book_imbalance", 0.70, 1.30)
         cfg.macro_max_vol_x = trial.suggest_float("macro_max_vol_x", 12.0, 120.0)
 

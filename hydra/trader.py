@@ -492,9 +492,6 @@ class HydraTrader:
         if candle_range > 0 and close_position(latest) < self.cfg.pump_candle_upper_pct:
             return None
         
-        if not self.market.btc_context_ok(strict=False):
-            return None
-        
         tnow = self.now()
         last = self.market.last_pump_alert.get(symbol)
         
