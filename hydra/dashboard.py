@@ -86,14 +86,14 @@ class Dashboard:
         self.locked_focus: str | None = None
         self.focus = BTC_SYMBOL
 
-        self.fig = plt.figure(figsize=(17, 11))
+        self.fig = plt.figure(figsize=(17, 12))
         self.fig.canvas.manager.set_window_title(f"Hydra Trader — LIVE [{params_source}]{title_suffix}")
         gs = GridSpec(
-            5, 4, figure=self.fig,
-            height_ratios=[2.1, 2.1, 1.55, 1.05, 1.25],
+            6, 4, figure=self.fig,
+            height_ratios=[2.0, 1.9, 1.35, 1.0, 1.15, 1.25],
             width_ratios=[1.5, 1.0, 1.5, 1.0],
-            left=0.06, right=0.985, top=0.955, bottom=0.045,
-            hspace=0.52, wspace=0.42,
+            left=0.06, right=0.985, top=0.955, bottom=0.040,
+            hspace=0.58, wspace=0.42,
         )
         self.ax_price = self.fig.add_subplot(gs[0, 0:2])
         self.ax_capital = self.fig.add_subplot(gs[0, 2:4])
@@ -102,8 +102,9 @@ class Dashboard:
         self.ax_micro = self.fig.add_subplot(gs[2, 0:2])
         self.ax_thrust = self.fig.add_subplot(gs[2, 2:4])
         self.ax_flow = self.fig.add_subplot(gs[3, :])
-        self.ax_status = self.fig.add_subplot(gs[4, 0:2])
-        self.ax_trades = self.fig.add_subplot(gs[4, 2:4])
+        self.ax_performance = self.fig.add_subplot(gs[4, :])
+        self.ax_status = self.fig.add_subplot(gs[5, 0:2])
+        self.ax_trades = self.fig.add_subplot(gs[5, 2:4])
         self.ax_regime = self.fig.add_subplot(gs[1, 3])
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
 
@@ -112,6 +113,7 @@ class Dashboard:
         self._setup_book()
         self._setup_tape()
         self._setup_flow()
+        self._setup_performance()
         self._setup_gauge(self.ax_micro, "_micro", MICRO_LABELS, MICRO_FMT, "book_ignition")
         self._setup_gauge(self.ax_thrust, "_thrust", THRUST_LABELS, THRUST_FMT, "macro_thrust")
         self._setup_text_panel(self.ax_status, "_status", "Strategy state")
@@ -439,6 +441,62 @@ class Dashboard:
         ax.set_ylim(*_pad_limits(churn + turb, fallback=(0.0, 0.01)))
         self.ax_flow_twin.set_ylim(*_pad_limits(visc_log, fallback=(0.0, 0.5)))
 
+    def _setup_performance(self):
+        ax = self.ax_performance
+        self._style_axes(ax, grid=True, alpha=0.12)
+        ax.set_xlabel("minutes ago", fontsize=8, color="#999")
+        ax.set_ylabel("net return / drawdown %", fontsize=8, color="#bbbbbb")
+        ax.tick_params(axis="y", labelcolor="#dddddd")
+        self.perf_net_line, = ax.plot([], [], color="#48d597", label="net return %", linewidth=1.35)
+        self.perf_dd_line, = ax.plot([], [], color="#ff5555", label="drawdown %", linewidth=1.05, alpha=0.86)
+        ax2 = ax.twinx()
+        self.ax_perf_twin = ax2
+        ax2.set_ylabel("return velocity %/h", fontsize=8, color="#6eb5ff")
+        ax2.tick_params(axis="y", labelcolor="#6eb5ff")
+        for sp in ("top",):
+            ax2.spines[sp].set_visible(False)
+        self.perf_rph_line, = ax2.plot([], [], color="#6eb5ff", label="session %/h", linewidth=1.15)
+        self.perf_eph_line, = ax2.plot([], [], color="#f5b942", label="exposure %/h", linewidth=1.15, alpha=0.9)
+        handles = [self.perf_net_line, self.perf_dd_line, self.perf_rph_line, self.perf_eph_line]
+        labs = [h.get_label() for h in handles]
+        ax.legend(handles, labs, loc="upper left", fontsize=7, framealpha=0.4, labelcolor="#cccccc")
+        self.perf_title = ax.set_title("Return velocity — waiting", color="#cccccc", fontsize=10, loc="left")
+        _set_axis_plain_numbers(ax)
+        _set_axis_plain_numbers(ax2)
+
+    def draw_performance(self, snap):
+        ax = self.ax_performance
+        data = list(snap["market"].performance_history)
+        if len(data) < 2:
+            for line in (self.perf_net_line, self.perf_dd_line, self.perf_rph_line, self.perf_eph_line):
+                line.set_data([], [])
+            self.perf_title.set_text("Return velocity — collecting…")
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            self.ax_perf_twin.set_ylim(-1, 1)
+            return
+        n = snap["market"].ts
+        xs = [(row[0] - n) / 60.0 for row in data]
+        net = [row[1] * 100.0 for row in data]
+        session_v = [row[2] * 100.0 for row in data]
+        exposure_v = [row[3] * 100.0 for row in data]
+        drawdown = [-row[4] * 100.0 for row in data]
+        self.perf_net_line.set_data(xs, net)
+        self.perf_dd_line.set_data(xs, drawdown)
+        self.perf_rph_line.set_data(xs, session_v)
+        self.perf_eph_line.set_data(xs, exposure_v)
+        last = data[-1]
+        avg_hold_min = last[6] / 60.0
+        self.perf_title.set_text(
+            f"Return velocity  net={net[-1]:+.2f}%  session={session_v[-1]:+.2f}%/h  "
+            f"exposure={exposure_v[-1]:+.2f}%/h  dd={-drawdown[-1]:.2f}%  "
+            f"hold_avg={avg_hold_min:.1f}m  trade_vel={last[8]:+.3f}%/m  "
+            f"horizon_score={last[5]:+.2f}"
+        )
+        ax.set_xlim(min(xs), max(xs) if max(xs) > min(xs) else min(xs) + 1)
+        ax.set_ylim(*_pad_limits(net + drawdown + [0.0], fallback=(-1.0, 1.0)))
+        self.ax_perf_twin.set_ylim(*_pad_limits(session_v + exposure_v + [0.0], fallback=(-1.0, 1.0)))
+
     def _setup_gauge(self, ax, suffix, labels, fmts, regime_name):
         y = list(range(len(labels)))
         bars = ax.barh(y, [0.0] * len(labels), color=["#444"] * len(labels), edgecolor="#222", height=0.7)
@@ -536,6 +594,16 @@ class Dashboard:
     def draw_status(self, snap):
         lines = [f"MODE: {snap['mode']}"]
         lines.append(f"BTC context: {'OK' if snap['btc_ok'] else 'WEAK'} | strict {'OK' if snap['btc_strict'] else 'NO'} | flush {'YES' if snap['btc_flush'] else 'no'}")
+        perf = snap.get("performance") or {}
+        if perf:
+            lines.append(
+                f"RETURN VELOCITY: net {perf.get('net_return', 0.0)*100:+.2f}% | "
+                f"session {perf.get('return_per_hour', 0.0)*100:+.2f}%/h | "
+                f"exposure {perf.get('return_per_exposure_hour', 0.0)*100:+.2f}%/h | "
+                f"avg hold {perf.get('avg_hold_sec', 0.0)/60.0:.1f}m | "
+                f"trade vel {perf.get('avg_return_velocity_pct_per_min', 0.0):+.3f}%/m | "
+                f"score {perf.get('horizon_score', 0.0):+.2f}"
+            )
         pos = snap.get("position")
         if pos:
             mark = snap["market"].last_price or pos["entry_signal"]
@@ -583,12 +651,18 @@ class Dashboard:
             self.text_trades.set_text("no trades yet  —  press 'o' to start an Optuna study")
             self.text_trades.set_color("#888")
             return
-        recent = trades[-7:][::-1]
-        header = f"{'time':<9}{'pair':<10}{'regime':<18}{'reason':<22}{'pnl':>10}"
+        recent = trades[-6:][::-1]
+        header = f"{'time':<9}{'pair':<10}{'regime':<12}{'reason':<20}{'pnl':>9}{'ret%':>8}{'hold':>7}{'vel%/m':>9}"
         lines = [header]
         for t in recent:
             etime = str(t.get("exit_time", ""))[11:19]
-            lines.append(f"{etime:<9}{t['pair']:<10}{t['regime']:<18}{t['reason']:<22}{t['pnl_usd']:>+10.4f}")
+            regime = str(t.get("regime", ""))[:11]
+            hold_min = float(t.get("hold_sec", 0.0) or 0.0) / 60.0
+            lines.append(
+                f"{etime:<9}{t['pair']:<10}{regime:<12}{str(t.get('reason',''))[:19]:<20}"
+                f"{t['pnl_usd']:>+9.4f}{float(t.get('return_pct', 0.0) or 0.0):>+8.2f}"
+                f"{hold_min:>6.1f}m{float(t.get('return_velocity_pct_per_min', 0.0) or 0.0):>+9.3f}"
+            )
         self.text_trades.set_text("\n".join(lines))
         self.text_trades.set_color("#dddddd")
 
@@ -626,19 +700,30 @@ class Dashboard:
         lines.append("")
         n_recordings = len(opt.get("replay_paths") or [])
         if n_recordings > 1:
-            lines.append(f"{'#':>4} {'score':>9} {'min':>8} {'tr':>3} {'wr':>4} {'net%':>7} {'dd%':>5}")
+            lines.append(f"{'#':>4} {'score':>9} {'min':>8} {'tr':>3} {'net%':>7} {'r/h':>7} {'e/h':>7} {'hold':>6} {'dd%':>5}")
         else:
-            lines.append(f"{'#':>4} {'score':>9} {'Δbest':>9} {'tr':>3} {'wr':>4} {'net%':>7} {'dd%':>5}")
+            lines.append(f"{'#':>4} {'score':>9} {'Δbest':>9} {'tr':>3} {'net%':>7} {'r/h':>7} {'e/h':>7} {'hold':>6} {'dd%':>5}")
         best = opt.get("best_score")
         for r in (opt.get("trials") or [])[-7:]:
             a = r.get("attrs", {})
             score = r.get("score") or 0.0
             mark = "★" if r.get("is_best") else " "
+            hold_min = float(a.get('avg_hold_sec', 0.0) or 0.0) / 60.0
             if n_recordings > 1:
-                lines.append(f"{mark}{r['n']:>3} {score:>+9.4f} {a.get('min_score',0):>+8.3f} {a.get('trades',0):>3} {a.get('win_rate',0):>4.2f} {a.get('net_return',0)*100:>+7.2f} {a.get('max_drawdown',0)*100:>5.2f}")
+                lines.append(
+                    f"{mark}{r['n']:>3} {score:>+9.4f} {a.get('min_score',0):>+8.3f} "
+                    f"{a.get('trades',0):>3} {a.get('net_return',0)*100:>+7.2f} "
+                    f"{a.get('return_per_hour',0)*100:>+7.2f} {a.get('return_per_exposure_hour',0)*100:>+7.2f} "
+                    f"{hold_min:>5.1f}m {a.get('max_drawdown',0)*100:>5.2f}"
+                )
             else:
                 delta = (score - best) if best is not None else 0.0
-                lines.append(f"{mark}{r['n']:>3} {score:>+9.4f} {delta:>+9.4f} {a.get('trades',0):>3} {a.get('win_rate',0):>4.2f} {a.get('net_return',0)*100:>+7.2f} {a.get('max_drawdown',0)*100:>5.2f}")
+                lines.append(
+                    f"{mark}{r['n']:>3} {score:>+9.4f} {delta:>+9.4f} "
+                    f"{a.get('trades',0):>3} {a.get('net_return',0)*100:>+7.2f} "
+                    f"{a.get('return_per_hour',0)*100:>+7.2f} {a.get('return_per_exposure_hour',0)*100:>+7.2f} "
+                    f"{hold_min:>5.1f}m {a.get('max_drawdown',0)*100:>5.2f}"
+                )
         self.text_trades.set_text("\n".join(lines))
         self.text_trades.set_color("#dddddd")
 
@@ -676,6 +761,7 @@ class Dashboard:
             self.draw_book(snap)
             self.draw_tape(snap)
             self.draw_flow(snap)
+            self.draw_performance(snap)
             self.draw_micro_gauges(snap)
             self.draw_thrust_gauges(snap)
             self.draw_capital(snap)
@@ -689,3 +775,6 @@ class Dashboard:
     def show(self):
         self.ani = FuncAnimation(self.fig, self.update, interval=150, cache_frame_data=False)
         plt.show()
+
+
+

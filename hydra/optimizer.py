@@ -146,14 +146,15 @@ class OptunaController:
 
     @staticmethod
     def _score(metrics: dict[str, Any], cfg: Config) -> float:
-        """Higher is better. Inactive runs must not collapse to a single constant
-        (previously everything with trades<2 scored -8.0 so trial 0 always 'won')."""
+        """Higher is better. The objective explicitly rewards return velocity:
+        high net return, high session return/hour, high exposure return/hour,
+        and fast trade-level velocity, while penalizing drawdown and long holds.
+        """
         trades = int(metrics.get("trades", 0) or 0)
         ret = float(metrics.get("net_return", 0.0) or 0.0)
         msgs = float(metrics.get("messages", 0) or 0.0)
 
         if trades == 0:
-            # Strong penalty; tiny spread so Optuna still prefers runs that at least move Capital/equity
             return -1.0e6 + min(msgs / 250_000.0, 80.0)
         if trades == 1:
             return (
@@ -163,19 +164,32 @@ class OptunaController:
                 + min(msgs / 200_000.0, 40.0)
             )
 
-        rph = float(metrics.get("return_per_hour", 0.0) or 0.0)
+        def bounded(x: float, lo: float, hi: float) -> float:
+            return max(lo, min(hi, x))
+
+        rph = bounded(float(metrics.get("return_per_hour", 0.0) or 0.0), -3.0, 3.0)
+        rpeh = bounded(float(metrics.get("return_per_exposure_hour", 0.0) or 0.0), -4.0, 4.0)
         dd = float(metrics.get("max_drawdown", 0.0) or 0.0)
         win_rate = float(metrics.get("win_rate", 0.0) or 0.0)
         worst_trade_pct = abs(float(metrics.get("worst_trade", 0.0) or 0.0)) / max(cfg.start_capital, 1e-9)
         avg_hold_min = float(metrics.get("avg_hold_sec", 0.0) or 0.0) / 60.0
+        median_hold_min = float(metrics.get("median_hold_sec", 0.0) or 0.0) / 60.0
+        exposure_ratio = float(metrics.get("exposure_ratio", 0.0) or 0.0)
+        trade_velocity = bounded(float(metrics.get("avg_return_velocity_pct_per_min", 0.0) or 0.0) / 100.0, -0.03, 0.03)
         activity = 12.0 * math.log1p(float(trades))
+        time_penalty = 2.8 * avg_hold_min + 1.5 * median_hold_min
+        exposure_drag = 18.0 * max(0.0, exposure_ratio - 0.60)
+
         return (
-            900.0 * rph
-            + 350.0 * ret
-            + 40.0 * win_rate
-            - 1800.0 * dd
-            - 350.0 * worst_trade_pct
-            - 1.5 * avg_hold_min
+            850.0 * rph
+            + 420.0 * rpeh
+            + 420.0 * ret
+            + 55.0 * win_rate
+            + 1500.0 * trade_velocity
+            - 2200.0 * dd
+            - 420.0 * worst_trade_pct
+            - time_penalty
+            - exposure_drag
             + activity
         )
 
@@ -259,30 +273,36 @@ class OptunaController:
         cfg.bi_trail_activate = trial.suggest_float("bi_trail_activate", 0.010, 0.060)
         cfg.bi_trail_pct = trial.suggest_float("bi_trail_pct", 0.005, 0.040)
         cfg.bi_take_profit = trial.suggest_float("bi_take_profit", 0.010, 0.045)
-        cfg.bi_max_hold = trial.suggest_float("bi_max_hold", 300.0, 1800.0)
-        cfg.bi_stall_check = trial.suggest_float("bi_stall_check", 60.0, 600.0)
+        cfg.bi_max_hold = trial.suggest_float("bi_max_hold", 120.0, 900.0)
+        cfg.bi_stall_check = trial.suggest_float("bi_stall_check", 45.0, 300.0)
         cfg.bi_stall_ret = trial.suggest_float("bi_stall_ret", 0.001, 0.020)
 
         cfg.mt_hard_stop = trial.suggest_float("mt_hard_stop", 0.015, 0.070)
         cfg.mt_trail_activate = trial.suggest_float("mt_trail_activate", 0.012, 0.060)
         cfg.mt_trail_pct = trial.suggest_float("mt_trail_pct", 0.006, 0.040)
         cfg.mt_take_profit = trial.suggest_float("mt_take_profit", 0.014, 0.070)
-        cfg.mt_max_hold = trial.suggest_float("mt_max_hold", 600.0, 5400.0)
-        cfg.mt_stall_check = trial.suggest_float("mt_stall_check", 180.0, 1800.0)
+        cfg.mt_max_hold = trial.suggest_float("mt_max_hold", 300.0, 1800.0)
+        cfg.mt_stall_check = trial.suggest_float("mt_stall_check", 90.0, 900.0)
         cfg.mt_stall_ret = trial.suggest_float("mt_stall_ret", 0.001, 0.020)
 
         cfg.mr_hard_stop = trial.suggest_float("mr_hard_stop", 0.020, 0.070)
         cfg.mr_trail_activate = trial.suggest_float("mr_trail_activate", 0.014, 0.060)
         cfg.mr_trail_pct = trial.suggest_float("mr_trail_pct", 0.006, 0.040)
         cfg.mr_take_profit = trial.suggest_float("mr_take_profit", 0.014, 0.075)
-        cfg.mr_max_hold = trial.suggest_float("mr_max_hold", 900.0, 7200.0)
-        cfg.mr_stall_check = trial.suggest_float("mr_stall_check", 180.0, 1800.0)
+        cfg.mr_max_hold = trial.suggest_float("mr_max_hold", 420.0, 2400.0)
+        cfg.mr_stall_check = trial.suggest_float("mr_stall_check", 120.0, 900.0)
         cfg.mr_stall_ret = trial.suggest_float("mr_stall_ret", 0.001, 0.020)
 
-        cfg.macro_early_fail_sec = trial.suggest_float("macro_early_fail_sec", 90.0, 420.0)
+        cfg.macro_early_fail_sec = trial.suggest_float("macro_early_fail_sec", 60.0, 300.0)
         cfg.macro_early_fail_ret = trial.suggest_float("macro_early_fail_ret", -0.025, -0.004)
-        cfg.macro_no_followthrough_sec = trial.suggest_float("macro_no_followthrough_sec", 180.0, 900.0)
+        cfg.macro_no_followthrough_sec = trial.suggest_float("macro_no_followthrough_sec", 120.0, 600.0)
         cfg.macro_no_followthrough_ret = trial.suggest_float("macro_no_followthrough_ret", -0.002, 0.012)
+
+        cfg.time_efficiency_check_sec = trial.suggest_float("time_efficiency_check_sec", 90.0, 360.0)
+        cfg.time_efficiency_min_ret = trial.suggest_float("time_efficiency_min_ret", 0.0005, 0.0080)
+        cfg.min_return_velocity_per_min = trial.suggest_float("min_return_velocity_per_min", 0.00005, 0.0015)
+        cfg.horizon_trail_tighten_sec = trial.suggest_float("horizon_trail_tighten_sec", 120.0, 900.0)
+        cfg.horizon_tight_trail_pct = trial.suggest_float("horizon_tight_trail_pct", 0.004, 0.018)
         return cfg
 
     def _run_thread(self, replay_paths: list[str], n_trials: int, train_frac: float, seed: int, robust_aggregate: bool) -> None:
@@ -314,23 +334,43 @@ class OptunaController:
                 agg_max_dd = 0.0
                 agg_final_total = 0.0
                 net_returns = []
+                return_per_hours = []
+                return_per_exposure_hours = []
+                horizon_scores = []
+                trade_velocities = []
+                weighted_hold_sec = 0.0
+                weighted_median_hold_sec = 0.0
                 self._set(stage="trial", current_trial=trial.number)
                 for path, t_start, t_split, _t_end in splits:
                     self._set(current_file=os.path.basename(path))
                     m = self._run_segment(path, cfg, t_start, t_split, symbol_sets=symbol_cache.get(path))
                     s = self._score(m, cfg)
                     scores.append(s)
-                    agg_trades += m["trades"]
-                    agg_wins += m["wins"]
+                    trades = int(m.get("trades", 0) or 0)
+                    agg_trades += trades
+                    agg_wins += int(m.get("wins", 0) or 0)
                     agg_max_dd = max(agg_max_dd, m["max_drawdown"])
                     agg_final_total += m["final_capital"]
                     net_returns.append(m["net_return"])
+                    return_per_hours.append(m.get("return_per_hour", 0.0))
+                    return_per_exposure_hours.append(m.get("return_per_exposure_hour", 0.0))
+                    horizon_scores.append(m.get("horizon_score", 0.0))
+                    trade_velocities.append(m.get("avg_return_velocity_pct_per_min", 0.0))
+                    weighted_hold_sec += float(m.get("avg_hold_sec", 0.0) or 0.0) * max(trades, 1)
+                    weighted_median_hold_sec += float(m.get("median_hold_sec", 0.0) or 0.0) * max(trades, 1)
                 mean_score = sum(scores) / len(scores)
                 min_score = min(scores)
                 win_rate = (agg_wins / agg_trades) if agg_trades else 0.0
+                hold_weight = max(agg_trades, len(splits))
                 trial.set_user_attr("trades", agg_trades)
                 trial.set_user_attr("win_rate", win_rate)
                 trial.set_user_attr("net_return", sum(net_returns) / len(net_returns) if net_returns else 0.0)
+                trial.set_user_attr("return_per_hour", sum(return_per_hours) / len(return_per_hours) if return_per_hours else 0.0)
+                trial.set_user_attr("return_per_exposure_hour", sum(return_per_exposure_hours) / len(return_per_exposure_hours) if return_per_exposure_hours else 0.0)
+                trial.set_user_attr("avg_hold_sec", weighted_hold_sec / hold_weight if hold_weight else 0.0)
+                trial.set_user_attr("median_hold_sec", weighted_median_hold_sec / hold_weight if hold_weight else 0.0)
+                trial.set_user_attr("avg_return_velocity_pct_per_min", sum(trade_velocities) / len(trade_velocities) if trade_velocities else 0.0)
+                trial.set_user_attr("horizon_score", sum(horizon_scores) / len(horizon_scores) if horizon_scores else 0.0)
                 trial.set_user_attr("max_drawdown", agg_max_dd)
                 trial.set_user_attr("final_capital", agg_final_total / len(splits) if splits else 0.0)
                 trial.set_user_attr("scores_per_recording", scores)
@@ -545,3 +585,6 @@ class AutoOptunaWatcher:
                 print(f"[AUTO_OPTUNA] started on {info} ({note})")
             else:
                 print(f"[AUTO_OPTUNA] could not start: {info}")
+
+
+

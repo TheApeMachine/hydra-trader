@@ -87,7 +87,12 @@ def main(argv=None):
     if args.replay and args.backtest:
         metrics = run_replay_backtest(args.replay, cfg=cfg, verbose=True)
         print("\n=== REPLAY BACKTEST DONE ===")
-        for k in ("trades", "wins", "win_rate", "total_pnl", "final_capital", "net_return", "max_drawdown", "return_per_hour"):
+        for k in (
+            "trades", "wins", "win_rate", "total_pnl", "final_capital",
+            "net_return", "max_drawdown", "return_per_hour",
+            "return_per_exposure_hour", "avg_hold_sec", "median_hold_sec",
+            "avg_return_velocity_pct_per_min", "horizon_score",
+        ):
             print(f"  {k}: {metrics[k]}")
         return
 
@@ -182,3 +187,6 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
+
+

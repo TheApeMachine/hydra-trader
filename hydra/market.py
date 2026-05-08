@@ -15,6 +15,7 @@ from .constants import (
     BTC_SYMBOL,
     DASH_CAPITAL_LEN,
     DASH_FLOW_LEN,
+    DASH_PERF_LEN,
     DASH_PRICE_LEN,
     DASH_TAPE_LEN,
     STATE_LEN,
@@ -54,6 +55,8 @@ class MarketView:
     book_imbalance: float | None
     # (ts, churn, visc_raw, turb_var, accel, signed_$_per_s) per sample
     flow_series: tuple[tuple[float, float, float, float, float, float], ...]
+    # (ts, net_ret, ret_per_hour, ret_per_exposure_hour, drawdown, horizon_score, avg_hold_sec, exposure_ratio, avg_velocity_pct_min, trades)
+    performance_history: tuple[tuple[float, float, float, float, float, float, float, float, float, float], ...]
 
 
 class MarketStore:
@@ -98,6 +101,7 @@ class MarketStore:
         self.last_pump_alert: dict[str, float] = {}
 
         self.capital_history = deque(maxlen=DASH_CAPITAL_LEN)
+        self.performance_history = deque(maxlen=DASH_PERF_LEN)
         self.price_history = defaultdict(lambda: deque(maxlen=DASH_PRICE_LEN))
         self.tape_pressure_history = defaultdict(lambda: deque(maxlen=DASH_TAPE_LEN))
         self.entry_marks = deque(maxlen=200)
@@ -134,6 +138,7 @@ class MarketStore:
             self.book_ready.clear()
             self.last_pump_alert.clear()
             self.capital_history.clear()
+            self.performance_history.clear()
             self.price_history.clear()
             self.tape_pressure_history.clear()
             self.entry_marks.clear()
@@ -607,6 +612,21 @@ class MarketStore:
         with self.lock:
             self.capital_history.append((when, cap))
 
+    def sample_performance(self, when: float, perf: dict[str, Any]) -> None:
+        with self.lock:
+            self.performance_history.append((
+                when,
+                float(perf.get("net_return", 0.0) or 0.0),
+                float(perf.get("return_per_hour", 0.0) or 0.0),
+                float(perf.get("return_per_exposure_hour", 0.0) or 0.0),
+                float(perf.get("current_drawdown", 0.0) or 0.0),
+                float(perf.get("horizon_score", 0.0) or 0.0),
+                float(perf.get("avg_hold_sec", 0.0) or 0.0),
+                float(perf.get("exposure_ratio", 0.0) or 0.0),
+                float(perf.get("avg_return_velocity_pct_per_min", 0.0) or 0.0),
+                float(perf.get("trades", 0.0) or 0.0),
+            ))
+
     def flow_snapshot_unlocked(self, symbol: str) -> dict[str, float]:
         dq = list(self.tape.get(symbol, []))
         if not dq:
@@ -674,6 +694,7 @@ class MarketStore:
                 spread_bps=self.spread_bps_unlocked(focus),
                 book_imbalance=self.book_imbalance_unlocked(focus, 5),
                 flow_series=tuple(self.flow_history[focus]),
+                performance_history=tuple(self.performance_history),
             )
 
     def clone_shallow_data(self) -> dict[str, Any]:
@@ -685,3 +706,6 @@ class MarketStore:
                 "last_price": dict(self.last_price),
                 "books": copy.deepcopy(self.books),
             }
+
+
+

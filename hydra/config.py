@@ -121,33 +121,40 @@ class Config:
     bi_trail_activate: float = 0.018
     bi_trail_pct: float = 0.012
     bi_take_profit: float = 0.024
-    bi_max_hold: float = 720.0
-    bi_stall_check: float = 120.0
-    bi_stall_ret: float = 0.005
+    bi_max_hold: float = 480.0
+    bi_stall_check: float = 90.0
+    bi_stall_ret: float = 0.006
 
     # risk: macro_thrust
     mt_hard_stop: float = 0.030
     mt_trail_activate: float = 0.018
     mt_trail_pct: float = 0.012
     mt_take_profit: float = 0.026
-    mt_max_hold: float = 1800.0
-    mt_stall_check: float = 420.0
-    mt_stall_ret: float = 0.003
+    mt_max_hold: float = 900.0
+    mt_stall_check: float = 240.0
+    mt_stall_ret: float = 0.004
 
     # risk: macro_reclaim_v2
     mr_hard_stop: float = 0.034
     mr_trail_activate: float = 0.020
     mr_trail_pct: float = 0.014
     mr_take_profit: float = 0.030
-    mr_max_hold: float = 2400.0
-    mr_stall_check: float = 540.0
-    mr_stall_ret: float = 0.004
+    mr_max_hold: float = 1200.0
+    mr_stall_check: float = 300.0
+    mr_stall_ret: float = 0.005
 
     # early failure cuts for macro entries
-    macro_early_fail_sec: float = 180.0
+    macro_early_fail_sec: float = 120.0
     macro_early_fail_ret: float = -0.012
-    macro_no_followthrough_sec: float = 420.0
-    macro_no_followthrough_ret: float = 0.003
+    macro_no_followthrough_sec: float = 300.0
+    macro_no_followthrough_ret: float = 0.004
+
+    # time-efficiency exits: require trades to make progress quickly enough
+    time_efficiency_check_sec: float = 210.0
+    time_efficiency_min_ret: float = 0.0025
+    min_return_velocity_per_min: float = 0.00035
+    horizon_trail_tighten_sec: float = 360.0
+    horizon_tight_trail_pct: float = 0.008
 
     def risk(self, regime: str) -> dict[str, float]:
         if regime == "book_ignition":
@@ -249,3 +256,6 @@ def maybe_load_config(
         return cfg, source
 
     return Config(), "defaults"
+
+
+

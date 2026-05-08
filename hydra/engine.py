@@ -195,7 +195,10 @@ class HydraEngine:
             self.trader.execute_due()
 
     def sample_capital(self) -> None:
-        self.market.sample_capital(self.clock.now(), self.capital())
+        when = self.clock.now()
+        cap = self.capital()
+        self.market.sample_capital(when, cap)
+        self.market.sample_performance(when, self.trader.performance_snapshot(self.n_messages))
 
     def force_exit_eob(self) -> None:
         if self.trader.pos:
@@ -221,7 +224,15 @@ class HydraEngine:
             for regime, trs in sorted(by_regime.items()):
                 rpnl = sum(x["pnl_usd"] for x in trs)
                 rw = sum(1 for x in trs if x["pnl_usd"] > 0)
-                print(f"   {regime}: {len(trs)} trades, {rw} wins, pnl=${rpnl:+.4f}")
+                avg_hold = sum(float(x.get("hold_sec", 0.0) or 0.0) for x in trs) / max(len(trs), 1) / 60.0
+                avg_vel = sum(float(x.get("return_velocity_pct_per_min", 0.0) or 0.0) for x in trs) / max(len(trs), 1)
+                print(f"   {regime}: {len(trs)} trades, {rw} wins, pnl=${rpnl:+.4f}, avg_hold={avg_hold:.1f}m, vel={avg_vel:+.3f}%/m")
+            m = self.metrics()
+            print(
+                f"   velocity: session={m['return_per_hour']*100:+.2f}%/h  "
+                f"exposure={m['return_per_exposure_hour']*100:+.2f}%/h  "
+                f"avg_hold={m['avg_hold_sec']/60.0:.1f}m  horizon_score={m['horizon_score']:+.2f}"
+            )
             print(f"   log: {self.trader.csv_path}")
         print("=" * 64 + "\n")
 
@@ -244,6 +255,7 @@ class HydraEngine:
             "btc_strict": self.market.btc_context_ok(True),
             "btc_flush": self.market.btc_flush_active(),
             "auto": auto,
+            "performance": self.trader.performance_snapshot(self.n_messages),
             "optuna": optuna or {},
             "backtest": backtest or {},
         }
@@ -406,3 +418,6 @@ def build_live_engine(cfg: Config, params_source: str, record_or_replay_paths: l
     print(f"Book/trade symbols: {', '.join(engine.trade_symbols[:40])}{'...' if len(engine.trade_symbols) > 40 else ''}")
     print(f"Params: {params_source}\n")
     return engine
+
+
+

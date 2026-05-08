@@ -105,3 +105,6 @@ def format_lines(flow: dict[str, Any]) -> list[str]:
         f"accel: {flow.get('flow_price_accel', 0):+.2f}",
         f"turbulence (var log ret): {tu:.2e}",
     ]
+
+
+

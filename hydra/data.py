@@ -229,3 +229,6 @@ def infer_recording_symbols(paths: list[str], max_lines_per_file: int = 200_000)
     if BTC_SYMBOL not in ohlc:
         ohlc.append(BTC_SYMBOL)
     return ohlc, book, trade
+
+
+

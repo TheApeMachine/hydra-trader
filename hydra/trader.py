@@ -251,6 +251,9 @@ class HydraTrader:
         pnl = proceeds - self.pos["entry_cost"]
         hold_sec = self.now() - self.pos["entry_time"]
         self.cash += proceeds
+        trade_ret = pnl / max(self.pos["entry_cost"], 1e-9)
+        hold_min = max(hold_sec / 60.0, 1.0 / 60.0)
+        return_velocity_per_min = trade_ret / hold_min
 
         rec = {
             "pair": pair,
@@ -265,6 +268,8 @@ class HydraTrader:
             "entry_cost": self.pos["entry_cost"],
             "reason": reason,
             "pnl_usd": pnl,
+            "return_pct": trade_ret * 100.0,
+            "return_velocity_pct_per_min": return_velocity_per_min * 100.0,
             "capital_after": self.cash,
             "note": self.pos["note"],
         }
@@ -391,6 +396,8 @@ class HydraTrader:
             return
 
         age = self.now() - self.pos["entry_time"]
+        age_min = max(age / 60.0, 1.0 / 60.0)
+        return_velocity_per_min = net_ret / age_min
         
         if self.pos["regime"] in ("macro_thrust", "macro_reclaim_v2"):
             if age >= self.cfg.macro_early_fail_sec and net_ret <= self.cfg.macro_early_fail_ret:
@@ -401,6 +408,15 @@ class HydraTrader:
                 self._exit(mark, "macro_no_followthrough")
                 return
 
+        efficiency_check = min(float(r["max_hold"]) * 0.55, self.cfg.time_efficiency_check_sec)
+        if (
+            age >= efficiency_check
+            and net_ret < self.cfg.time_efficiency_min_ret
+            and return_velocity_per_min < self.cfg.min_return_velocity_per_min
+        ):
+            self._exit(mark, "return_velocity_stall")
+            return
+
         if not self.pos["trail_active"] and net_ret >= r["trail_activate"]:
             self.pos["trail_active"] = True
         
@@ -408,8 +424,14 @@ class HydraTrader:
                 t = datetime.now().strftime("%H:%M:%S")
                 print(f"[{t}] [{self.name:12s}] Trail ON {symbol} net {net_ret*100:+.2f}%")
 
-        if self.pos["trail_active"] and mark <= self.pos["peak_mark"] * (1 - r["trail_pct"]):
-            self._exit(mark, "trail")
+        trail_pct = r["trail_pct"]
+        tightens_at = min(float(r["max_hold"]) * 0.55, self.cfg.horizon_trail_tighten_sec)
+        if age >= tightens_at and net_ret > self.cfg.time_efficiency_min_ret:
+            trail_pct = min(trail_pct, self.cfg.horizon_tight_trail_pct)
+
+        if self.pos["trail_active"] and mark <= self.pos["peak_mark"] * (1 - trail_pct):
+            reason = "horizon_tight_trail" if trail_pct < r["trail_pct"] else "trail"
+            self._exit(mark, reason)
             return
 
         if age >= r["max_hold"]:
@@ -798,37 +820,89 @@ class HydraTrader:
 
     def summary_metrics(self, n_msgs: int = 0) -> dict[str, Any]:
         final = self.cash if not self.pos else self.capital_now()
-        pnls = [t["pnl_usd"] for t in self.trades]
+        pnls = [float(t["pnl_usd"]) for t in self.trades]
         wins = sum(1 for p in pnls if p > 0)
         total = len(pnls)
+        total_pnl = sum(pnls)
 
         peak = self.cfg.start_capital
         max_dd = 0.0
-        caps = list(self.market.capital_history)
-        
+        current_dd = 0.0
+        with self.market.lock:
+            caps = list(self.market.capital_history)
         for _, cap in caps:
             peak = max(peak, cap)
             dd = (peak - cap) / peak if peak > 0 else 0.0
             max_dd = max(max_dd, dd)
+            current_dd = dd
+        if final > peak:
+            peak = final
+            current_dd = 0.0
+        elif peak > 0:
+            current_dd = (peak - final) / peak
+            max_dd = max(max_dd, current_dd)
 
-        by_regime = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
-        
+        by_regime = defaultdict(lambda: {
+            "n": 0,
+            "wins": 0,
+            "pnl": 0.0,
+            "hold_sec": 0.0,
+            "return_pct": 0.0,
+            "return_velocity_pct_per_min": 0.0,
+        })
         for t in self.trades:
             b = by_regime[t["regime"]]
             b["n"] += 1
-            b["pnl"] += t["pnl_usd"]
-        
-            if t["pnl_usd"] > 0:
+            b["pnl"] += float(t.get("pnl_usd", 0.0) or 0.0)
+            b["hold_sec"] += float(t.get("hold_sec", 0.0) or 0.0)
+            b["return_pct"] += float(t.get("return_pct", 0.0) or 0.0)
+            b["return_velocity_pct_per_min"] += float(t.get("return_velocity_pct_per_min", 0.0) or 0.0)
+            if float(t.get("pnl_usd", 0.0) or 0.0) > 0:
                 b["wins"] += 1
+        by_regime_out = {}
+        for k, v in by_regime.items():
+            n = max(int(v["n"]), 1)
+            row = dict(v)
+            row["avg_hold_sec"] = row["hold_sec"] / n
+            row["avg_return_pct"] = row["return_pct"] / n
+            row["avg_return_velocity_pct_per_min"] = row["return_velocity_pct_per_min"] / n
+            by_regime_out[k] = row
 
         duration_hours = 1 / 60.0
-        
         if len(caps) >= 2:
             duration_hours = max((caps[-1][0] - caps[0][0]) / 3600.0, 1 / 60.0)
 
-        holds = [float(t.get("hold_sec", 0.0)) for t in self.trades]
-        avg_hold_sec = sum(holds) / len(holds) if holds else 0.0
-        exposure_hours = sum(holds) / 3600.0 if holds else 0.0
+        closed_holds = [float(t.get("hold_sec", 0.0) or 0.0) for t in self.trades]
+        open_hold_sec = (self.now() - self.pos["entry_time"]) if self.pos else 0.0
+        exposure_hours = (sum(closed_holds) + max(open_hold_sec, 0.0)) / 3600.0
+        exposure_ratio = min(exposure_hours / duration_hours, 1.0) if duration_hours > 0 else 0.0
+        avg_hold_sec = sum(closed_holds) / len(closed_holds) if closed_holds else 0.0
+        median_hold_sec = median(closed_holds, 0.0)
+        win_holds = [float(t.get("hold_sec", 0.0) or 0.0) for t in self.trades if float(t.get("pnl_usd", 0.0) or 0.0) > 0]
+        loss_holds = [float(t.get("hold_sec", 0.0) or 0.0) for t in self.trades if float(t.get("pnl_usd", 0.0) or 0.0) <= 0]
+        trade_returns = [float(t.get("return_pct", 0.0) or 0.0) / 100.0 for t in self.trades]
+        trade_velocities = [float(t.get("return_velocity_pct_per_min", 0.0) or 0.0) / 100.0 for t in self.trades]
+
+        net_return = (final / self.cfg.start_capital - 1.0) if self.cfg.start_capital else 0.0
+        return_per_hour = net_return / duration_hours if duration_hours > 0 else 0.0
+        profit_per_hour = total_pnl / duration_hours if duration_hours > 0 else 0.0
+        return_per_exposure_hour = net_return / exposure_hours if exposure_hours > 0 else 0.0
+        pnl_per_exposure_hour = total_pnl / exposure_hours if exposure_hours > 0 else 0.0
+        avg_trade_velocity = sum(trade_velocities) / len(trade_velocities) if trade_velocities else 0.0
+        median_trade_velocity = median(trade_velocities, 0.0)
+        avg_trade_return = sum(trade_returns) / len(trade_returns) if trade_returns else 0.0
+        median_trade_return = median(trade_returns, 0.0)
+        avg_hold_min = avg_hold_sec / 60.0
+        median_hold_min = median_hold_sec / 60.0
+        horizon_score = (
+            100.0 * net_return
+            + 35.0 * return_per_hour
+            + 20.0 * return_per_exposure_hour
+            + 20.0 * avg_trade_velocity
+            - 120.0 * max_dd
+            - 0.60 * avg_hold_min
+            - 0.40 * median_hold_min
+        )
 
         return {
             "messages": n_msgs,
@@ -836,16 +910,47 @@ class HydraTrader:
             "wins": wins,
             "losses": total - wins,
             "win_rate": (wins / total) if total else 0.0,
-            "total_pnl": sum(pnls),
+            "total_pnl": total_pnl,
             "best_trade": max(pnls) if pnls else 0.0,
             "worst_trade": min(pnls) if pnls else 0.0,
+            "best_trade_return_pct": max(trade_returns) * 100.0 if trade_returns else 0.0,
+            "worst_trade_return_pct": min(trade_returns) * 100.0 if trade_returns else 0.0,
             "final_capital": final,
-            "net_return": (final / self.cfg.start_capital - 1.0) if self.cfg.start_capital else 0.0,
+            "net_return": net_return,
             "max_drawdown": max_dd,
+            "current_drawdown": current_dd,
             "duration_hours": duration_hours,
-            "profit_per_hour": sum(pnls) / duration_hours,
-            "return_per_hour": ((final / self.cfg.start_capital - 1.0) / duration_hours) if self.cfg.start_capital else 0.0,
+            "profit_per_hour": profit_per_hour,
+            "return_per_hour": return_per_hour,
+            "return_per_exposure_hour": return_per_exposure_hour,
+            "pnl_per_exposure_hour": pnl_per_exposure_hour,
             "avg_hold_sec": avg_hold_sec,
+            "median_hold_sec": median_hold_sec,
+            "avg_win_hold_sec": sum(win_holds) / len(win_holds) if win_holds else 0.0,
+            "avg_loss_hold_sec": sum(loss_holds) / len(loss_holds) if loss_holds else 0.0,
+            "open_hold_sec": max(open_hold_sec, 0.0),
             "exposure_hours": exposure_hours,
-            "by_regime": {k: dict(v) for k, v in by_regime.items()},
+            "exposure_ratio": exposure_ratio,
+            "avg_trade_return_pct": avg_trade_return * 100.0,
+            "median_trade_return_pct": median_trade_return * 100.0,
+            "avg_return_velocity_pct_per_min": avg_trade_velocity * 100.0,
+            "median_return_velocity_pct_per_min": median_trade_velocity * 100.0,
+            "horizon_score": horizon_score,
+            "by_regime": by_regime_out,
         }
+
+    def performance_snapshot(self, n_msgs: int = 0) -> dict[str, Any]:
+        m = self.summary_metrics(n_msgs)
+        return {
+            "net_return": m["net_return"],
+            "return_per_hour": m["return_per_hour"],
+            "return_per_exposure_hour": m["return_per_exposure_hour"],
+            "current_drawdown": m["current_drawdown"],
+            "horizon_score": m["horizon_score"],
+            "avg_hold_sec": m["avg_hold_sec"],
+            "median_hold_sec": m["median_hold_sec"],
+            "exposure_ratio": m["exposure_ratio"],
+            "avg_return_velocity_pct_per_min": m["avg_return_velocity_pct_per_min"],
+            "trades": m["trades"],
+        }
+
