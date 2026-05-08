@@ -8,7 +8,46 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARAMS_PATH = PROJECT_ROOT / "hydra_best.json"
+RELAXED_PARAMS_PATH = PROJECT_ROOT / "hydra_relaxed.json"
 CANDIDATE_PARAMS_PATH = PROJECT_ROOT / "hydra_candidate.json"
+
+
+def _best_json_validated_zero_trades(data: dict[str, Any]) -> bool:
+    """True if Optuna export includes validation rows and every one has trades==0."""
+    rec = data.get("best_validation_by_recording")
+    if not isinstance(rec, list) or not rec:
+        return False
+    for item in rec:
+        if not isinstance(item, dict):
+            return False
+        m = item.get("metrics")
+        if not isinstance(m, dict):
+            return False
+        if int(m.get("trades", 0)) > 0:
+            return False
+    return True
+
+
+def _should_fallback_from_degenerate_best(path_hint: str | Path | None, target: Path) -> bool:
+    return path_hint is None and target.resolve() == DEFAULT_PARAMS_PATH.resolve()
+
+
+def _try_fallback_relaxed(quiet: bool) -> tuple[Config, str]:
+    if not RELAXED_PARAMS_PATH.exists():
+        if not quiet:
+            print(
+                "  [config] promoted best validated with 0 trades; "
+                f"{RELAXED_PARAMS_PATH.name} missing — using built-in defaults."
+            )
+        return Config(), "defaults (0-trade best, no relaxed file)"
+
+    cfg = load_config(RELAXED_PARAMS_PATH)
+    if not quiet:
+        print(
+            f"  [config] promoted best validated with 0 trades — loading "
+            f"{RELAXED_PARAMS_PATH.name} instead."
+        )
+    return cfg, f"relaxed ({RELAXED_PARAMS_PATH.name})"
 
 
 @dataclasses.dataclass
@@ -193,6 +232,14 @@ def maybe_load_config(
     target = Path(path) if path else DEFAULT_PARAMS_PATH
 
     if target.exists():
+        if _should_fallback_from_degenerate_best(path, target):
+            try:
+                raw = json.loads(target.read_text())
+            except (OSError, json.JSONDecodeError):
+                raw = None
+            if isinstance(raw, dict) and _best_json_validated_zero_trades(raw):
+                return _try_fallback_relaxed(quiet)
+
         cfg = load_config(target)
         source = f"tuned ({target.name})"
 

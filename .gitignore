@@ -4,3 +4,8 @@ runs/yesterday.jsonl
 hydra_best.json
 hydra_candidate.json
 runs/2026-05-08_0621.jsonl
+hydra_relaxed.json
+trades_hydra_dash.csv
+runs/2026-05-08_1810.jsonl
+runs/2026-05-08_2239.jsonl
+hydra_relaxed.json
