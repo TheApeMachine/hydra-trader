@@ -14,10 +14,12 @@ from .constants import (
     BOOK_STALE_SEC,
     BTC_SYMBOL,
     DASH_CAPITAL_LEN,
+    DASH_FLOW_LEN,
     DASH_PRICE_LEN,
     DASH_TAPE_LEN,
     STATE_LEN,
 )
+from . import flow_metrics
 from .utils import clamp, close_position, median, sf
 
 
@@ -50,6 +52,8 @@ class MarketView:
     last_price: float
     spread_bps: float | None
     book_imbalance: float | None
+    # (ts, churn, visc_raw, turb_var, accel, signed_$_per_s) per sample
+    flow_series: tuple[tuple[float, float, float, float, float, float], ...]
 
 
 class MarketStore:
@@ -99,6 +103,9 @@ class MarketStore:
         self.entry_marks = deque(maxlen=200)
         self.exit_marks = deque(maxlen=200)
         self.decision_snapshots: dict[str, dict[str, Any]] = {}
+        self.flow_history: dict[str, deque[tuple[float, float, float, float, float, float]]] = defaultdict(
+            lambda: deque(maxlen=DASH_FLOW_LEN)
+        )
 
     def now(self) -> float:
         return self.clock.now()
@@ -132,6 +139,7 @@ class MarketStore:
             self.entry_marks.clear()
             self.exit_marks.clear()
             self.decision_snapshots.clear()
+            self.flow_history.clear()
 
     # ── candle state ────────────────────────────────────
     def update_candle(self, c: dict[str, Any]) -> ClosedCandleEvent | None:
@@ -541,7 +549,7 @@ class MarketStore:
         sp = self.spread_bps_unlocked(symbol)
         book_imb = self.book_imbalance_unlocked(symbol, 5)
         max_spread = 10.0 if symbol in ("BTC/USD", "ETH/USD") else 150.0
-        return {
+        base = {
             "trades": len(dq),
             "buy_not": buy_not,
             "sell_not": sell_not,
@@ -555,6 +563,8 @@ class MarketStore:
             "baseline_duration": baseline_duration,
             "baseline_buy_share": baseline_buy_share,
         }
+        base.update(self.flow_snapshot_unlocked(symbol))
+        return base
 
     def snapshot_thrust(self, symbol: str) -> dict[str, Any] | None:
         with self.lock:
@@ -597,6 +607,27 @@ class MarketStore:
         with self.lock:
             self.capital_history.append((when, cap))
 
+    def flow_snapshot_unlocked(self, symbol: str) -> dict[str, float]:
+        dq = list(self.tape.get(symbol, []))
+        if not dq:
+            return {}
+        buy_not = self.tape_buy_sum.get(symbol, 0.0)
+        sell_not = self.tape_sell_sum.get(symbol, 0.0)
+        bid_depth = sum(p * q for p, q in self.top_bids_unlocked(symbol, 10))
+        ask_depth = sum(p * q for p, q in self.top_asks_unlocked(symbol, 10))
+        return flow_metrics.compute(
+            dq,
+            tnow=self.now(),
+            buy_not=buy_not,
+            sell_not=sell_not,
+            bid_depth_usd=bid_depth,
+            ask_depth_usd=ask_depth,
+        )
+
+    def flow_snapshot(self, symbol: str) -> dict[str, float]:
+        with self.lock:
+            return self.flow_snapshot_unlocked(symbol)
+
     def focus_candidate(self, preferred: str | None, position_pair: str | None = None) -> str:
         with self.lock:
             if preferred:
@@ -613,6 +644,19 @@ class MarketStore:
         with self.lock:
             snap = self.decision_snapshots.get(focus, {})
             micro = dict(snap)
+            fd = self.flow_snapshot_unlocked(focus)
+            micro.update(fd)
+            tref = self.now()
+            self.flow_history[focus].append(
+                (
+                    tref,
+                    float(fd.get("flow_churn", 0.0)),
+                    float(fd.get("flow_viscosity", 0.0)),
+                    float(fd.get("flow_turbulence_ret_var", 0.0)),
+                    float(fd.get("flow_price_accel", 0.0)),
+                    float(fd.get("flow_signed_usd_per_s", 0.0)),
+                )
+            )
             thrust = {k: v for k, v in snap.items() if k.startswith("thrust_")}
             return MarketView(
                 ts=self.now(),
@@ -629,6 +673,7 @@ class MarketStore:
                 last_price=self.last_price.get(focus, 0.0),
                 spread_bps=self.spread_bps_unlocked(focus),
                 book_imbalance=self.book_imbalance_unlocked(focus, 5),
+                flow_series=tuple(self.flow_history[focus]),
             )
 
     def clone_shallow_data(self) -> dict[str, Any]:

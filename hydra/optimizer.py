@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import threading
 import time
@@ -145,16 +146,38 @@ class OptunaController:
 
     @staticmethod
     def _score(metrics: dict[str, Any], cfg: Config) -> float:
-        trades = metrics.get("trades", 0)
-        if trades < 2:
-            return -8.0
-        ret = metrics.get("net_return", 0.0)
-        rph = metrics.get("return_per_hour", 0.0)
-        dd = metrics.get("max_drawdown", 0.0)
-        win_rate = metrics.get("win_rate", 0.0)
-        worst_trade_pct = abs(metrics.get("worst_trade", 0.0)) / max(cfg.start_capital, 1e-9)
-        avg_hold_min = metrics.get("avg_hold_sec", 0.0) / 60.0
-        return 900.0 * rph + 350.0 * ret + 40.0 * win_rate - 1800.0 * dd - 350.0 * worst_trade_pct - 1.5 * avg_hold_min
+        """Higher is better. Inactive runs must not collapse to a single constant
+        (previously everything with trades<2 scored -8.0 so trial 0 always 'won')."""
+        trades = int(metrics.get("trades", 0) or 0)
+        ret = float(metrics.get("net_return", 0.0) or 0.0)
+        msgs = float(metrics.get("messages", 0) or 0.0)
+
+        if trades == 0:
+            # Strong penalty; tiny spread so Optuna still prefers runs that at least move Capital/equity
+            return -1.0e6 + min(msgs / 250_000.0, 80.0)
+        if trades == 1:
+            return (
+                -50_000.0
+                + 2_500.0 * float(metrics.get("win_rate", 0.0) or 0.0)
+                + 15_000.0 * ret
+                + min(msgs / 200_000.0, 40.0)
+            )
+
+        rph = float(metrics.get("return_per_hour", 0.0) or 0.0)
+        dd = float(metrics.get("max_drawdown", 0.0) or 0.0)
+        win_rate = float(metrics.get("win_rate", 0.0) or 0.0)
+        worst_trade_pct = abs(float(metrics.get("worst_trade", 0.0) or 0.0)) / max(cfg.start_capital, 1e-9)
+        avg_hold_min = float(metrics.get("avg_hold_sec", 0.0) or 0.0) / 60.0
+        activity = 12.0 * math.log1p(float(trades))
+        return (
+            900.0 * rph
+            + 350.0 * ret
+            + 40.0 * win_rate
+            - 1800.0 * dd
+            - 350.0 * worst_trade_pct
+            - 1.5 * avg_hold_min
+            + activity
+        )
 
     @staticmethod
     def _aggregate(scores: list[float], robust: bool) -> float:
@@ -220,6 +243,7 @@ class OptunaController:
         cfg.macro_max_spread_bps = trial.suggest_float("macro_max_spread_bps", 10.0, 150.0)
         cfg.macro_min_book_imbalance = trial.suggest_float("macro_min_book_imbalance", 0.70, 1.30)
         cfg.macro_max_vol_x = trial.suggest_float("macro_max_vol_x", 12.0, 120.0)
+        cfg.macro_require_microstructure = trial.suggest_categorical("macro_require_microstructure", [False, True])
 
         cfg.max_portfolio_heat = trial.suggest_float("max_portfolio_heat", 0.35, 0.80)
         cfg.daily_loss_limit = trial.suggest_float("daily_loss_limit", 0.05, 0.22)
@@ -370,7 +394,13 @@ class OptunaController:
 
             cand_val_agg = self._aggregate(val_scores, robust_aggregate)
             base_val_agg = self._aggregate(base_val_scores, robust_aggregate)
-            promoted = cand_val_agg >= base_val_agg
+
+            train_trades = int(best_trial.user_attrs.get("trades", 0) or 0)
+            val_trade_sum = sum(int(r["metrics"].get("trades", 0) or 0) for r in val_rows)
+            has_activity = train_trades >= 2 and val_trade_sum >= 1
+            beats_baseline = cand_val_agg > base_val_agg
+            promoted = bool(beats_baseline and has_activity)
+
             out = {
                 "study_name": "hydra_v5_independent",
                 "best_score": study.best_value,
@@ -382,6 +412,12 @@ class OptunaController:
                 "baseline_validation_scores": base_val_scores,
                 "baseline_validation_aggregate": base_val_agg,
                 "promoted_to_best": promoted,
+                "promotion_gate": {
+                    "train_trades": train_trades,
+                    "val_trade_sum": val_trade_sum,
+                    "beats_baseline": beats_baseline,
+                    "has_min_activity": has_activity,
+                },
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "replay_paths": list(replay_paths),
                 "robust_aggregate": robust_aggregate,
@@ -389,9 +425,14 @@ class OptunaController:
             CANDIDATE_PARAMS_PATH.write_text(json.dumps(out, indent=2, default=str))
             if promoted:
                 DEFAULT_PARAMS_PATH.write_text(json.dumps(out, indent=2, default=str))
-                msg = f"done — candidate beat baseline; wrote {DEFAULT_PARAMS_PATH.resolve()}"
+                msg = f"done — candidate beat baseline ({cand_val_agg:.4f} > {base_val_agg:.4f}) with activity; wrote {DEFAULT_PARAMS_PATH.resolve()}"
             else:
-                msg = f"done — candidate did NOT beat baseline; wrote {CANDIDATE_PARAMS_PATH.resolve()} only"
+                reason = []
+                if not beats_baseline:
+                    reason.append(f"score {cand_val_agg:.4f} ≤ baseline {base_val_agg:.4f}")
+                if not has_activity:
+                    reason.append(f"insufficient trades (train={train_trades}, val_sum={val_trade_sum})")
+                msg = f"done — NOT promoted ({'; '.join(reason)}); wrote {CANDIDATE_PARAMS_PATH.resolve()} only"
             print("[OPTUNA]", msg)
             self._set(
                 stage="done",

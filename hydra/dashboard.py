@@ -13,6 +13,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import ScalarFormatter
 
 from .constants import BTC_SYMBOL, DASH_PRICE_LEN
+from .flow_metrics import format_lines
 from .utils import breakeven_move_pct
 
 _EMPTY_OFFSETS = np.empty((0, 2))
@@ -85,14 +86,14 @@ class Dashboard:
         self.locked_focus: str | None = None
         self.focus = BTC_SYMBOL
 
-        self.fig = plt.figure(figsize=(17, 10))
+        self.fig = plt.figure(figsize=(17, 11))
         self.fig.canvas.manager.set_window_title(f"Hydra Trader — LIVE [{params_source}]{title_suffix}")
         gs = GridSpec(
-            4, 4, figure=self.fig,
-            height_ratios=[2.2, 2.2, 1.7, 1.4],
+            5, 4, figure=self.fig,
+            height_ratios=[2.1, 2.1, 1.55, 1.05, 1.25],
             width_ratios=[1.5, 1.0, 1.5, 1.0],
-            left=0.06, right=0.985, top=0.955, bottom=0.05,
-            hspace=0.55, wspace=0.42,
+            left=0.06, right=0.985, top=0.955, bottom=0.045,
+            hspace=0.52, wspace=0.42,
         )
         self.ax_price = self.fig.add_subplot(gs[0, 0:2])
         self.ax_capital = self.fig.add_subplot(gs[0, 2:4])
@@ -100,8 +101,9 @@ class Dashboard:
         self.ax_tape = self.fig.add_subplot(gs[1, 1:3])
         self.ax_micro = self.fig.add_subplot(gs[2, 0:2])
         self.ax_thrust = self.fig.add_subplot(gs[2, 2:4])
-        self.ax_status = self.fig.add_subplot(gs[3, 0:2])
-        self.ax_trades = self.fig.add_subplot(gs[3, 2:4])
+        self.ax_flow = self.fig.add_subplot(gs[3, :])
+        self.ax_status = self.fig.add_subplot(gs[4, 0:2])
+        self.ax_trades = self.fig.add_subplot(gs[4, 2:4])
         self.ax_regime = self.fig.add_subplot(gs[1, 3])
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
 
@@ -109,6 +111,7 @@ class Dashboard:
         self._setup_capital()
         self._setup_book()
         self._setup_tape()
+        self._setup_flow()
         self._setup_gauge(self.ax_micro, "_micro", MICRO_LABELS, MICRO_FMT, "book_ignition")
         self._setup_gauge(self.ax_thrust, "_thrust", THRUST_LABELS, THRUST_FMT, "macro_thrust")
         self._setup_text_panel(self.ax_status, "_status", "Strategy state")
@@ -383,6 +386,59 @@ class Dashboard:
         ax.set_xlim(min(xs), max(xs) if max(xs) > min(xs) else min(xs) + 1)
         ax.set_ylim(*_pad_limits(buys + sells + [0.0]))
 
+    def _setup_flow(self):
+        ax = self.ax_flow
+        self._style_axes(ax, grid=True, alpha=0.12)
+        ax.set_xlabel("seconds ago", fontsize=8, color="#999")
+        ax.set_ylabel("churn, turb×1e4", fontsize=8, color="#bbbbbb")
+        ax.tick_params(axis="y", labelcolor="#dddddd")
+        self.flow_line_churn, = ax.plot([], [], color="#f5b942", label="churn (impulse/depth)", linewidth=1.35)
+        self.flow_line_turb, = ax.plot([], [], color="#c678ff", label="turb×1e4", linewidth=1.05, alpha=0.88)
+        ax2 = ax.twinx()
+        self.ax_flow_twin = ax2
+        ax2.set_ylabel("log10(1+viscosity)", fontsize=8, color="#6eb5ff")
+        ax2.tick_params(axis="y", labelcolor="#6eb5ff")
+        for sp in ("top",):
+            ax2.spines[sp].set_visible(False)
+        self.flow_line_visc, = ax2.plot([], [], color="#6eb5ff", label="log10(1+visc)", linewidth=1.15)
+        handles = [self.flow_line_churn, self.flow_line_turb, self.flow_line_visc]
+        labs = [h.get_label() for h in handles]
+        ax.legend(handles, labs, loc="upper left", fontsize=7, framealpha=0.4, labelcolor="#cccccc")
+        self.flow_title = ax.set_title("Flow field — waiting", color="#cccccc", fontsize=10, loc="left")
+        _set_axis_plain_numbers(ax)
+
+    def draw_flow(self, snap):
+        view = snap["market"]
+        data = list(view.flow_series)
+        sym = snap["focus"]
+        n = view.ts
+        ax = self.ax_flow
+        if len(data) < 2:
+            self.flow_line_churn.set_data([], [])
+            self.flow_line_turb.set_data([], [])
+            self.flow_line_visc.set_data([], [])
+            self.flow_title.set_text(f"Flow field — {sym} (collecting…)")
+            ax.set_xlim(-60, 1)
+            ax.set_ylim(0, 1)
+            self.ax_flow_twin.set_ylim(0, 1)
+            return
+        xs = [row[0] - n for row in data]
+        churn = [row[1] for row in data]
+        turb = [row[3] * 1e4 for row in data]
+        visc_log = [math.log10(1.0 + max(row[2], 0.0)) for row in data]
+        self.flow_line_churn.set_data(xs, churn)
+        self.flow_line_turb.set_data(xs, turb)
+        self.flow_line_visc.set_data(xs, visc_log)
+        last_a = data[-1][4]
+        last_s = data[-1][5]
+        self.flow_title.set_text(
+            f"Flow field — {sym}  last: churn={churn[-1]:.4f}  turb×1e4={turb[-1]:.4f}  "
+            f"log10(1+visc)={visc_log[-1]:.2f}  accel={last_a:+.2f}  signed $/s={last_s:+.0f}"
+        )
+        ax.set_xlim(min(xs), max(xs) if max(xs) > min(xs) else min(xs) + 1)
+        ax.set_ylim(*_pad_limits(churn + turb, fallback=(0.0, 0.01)))
+        self.ax_flow_twin.set_ylim(*_pad_limits(visc_log, fallback=(0.0, 0.5)))
+
     def _setup_gauge(self, ax, suffix, labels, fmts, regime_name):
         y = list(range(len(labels)))
         bars = ax.barh(y, [0.0] * len(labels), color=["#444"] * len(labels), edgecolor="#222", height=0.7)
@@ -597,6 +653,7 @@ class Dashboard:
         s = snap["market"].micro or {}
         be_pct = breakeven_move_pct(self.cfg) * 100.0
         baseline_buy = (s.get("buy_not") or 0) / max(s.get("burst_ratio") or 1, 1e-9)
+        flow_keys = {k: v for k, v in s.items() if str(k).startswith("flow_")}
         info = [
             f"focus: {snap['focus']}",
             "  [1/2/3=lock 0=auto]",
@@ -605,6 +662,8 @@ class Dashboard:
             f"buy 12s: ${s.get('buy_not', 0):,.0f}",
             f"base/12s: ${baseline_buy:,.0f}",
             f"params: {snap['params_source']}",
+            "",
+            *format_lines(flow_keys),
         ]
         self.text_regime.set_text("\n".join(info))
 
@@ -616,6 +675,7 @@ class Dashboard:
             self.draw_price(snap)
             self.draw_book(snap)
             self.draw_tape(snap)
+            self.draw_flow(snap)
             self.draw_micro_gauges(snap)
             self.draw_thrust_gauges(snap)
             self.draw_capital(snap)

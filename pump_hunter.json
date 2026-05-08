@@ -1,8 +1,0 @@
-{
-  "micro_min_buy_notional": 8000.0,
-  "micro_min_trades": 8,
-  "micro_min_move_pct": 0.015,
-  "bi_trail_activate": 0.01,
-  "bi_trail_pct": 0.005,
-  "bi_hard_stop": 0.02
-}
