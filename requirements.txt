@@ -1,0 +1,6 @@
+requests
+websockets
+pandas
+numpy
+matplotlib
+optuna
