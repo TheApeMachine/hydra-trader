@@ -670,9 +670,6 @@ class HydraTrader:
         
         if self.pos or symbol not in self.market.trade_symbols or not self.market.book_is_fresh(symbol):
             return
-        
-        if symbol != BTC_SYMBOL and not self.market.btc_context_ok(strict=False):
-            return
 
         tnow = self.now()
         

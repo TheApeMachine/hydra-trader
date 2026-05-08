@@ -306,7 +306,7 @@ async def status_loop(engine: HydraEngine) -> None:
 
 async def capital_tracker(engine: HydraEngine) -> None:
     while not engine.run_control.stop_requested.is_set():
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.2)
         if engine.run_control.live_paused.is_set():
             continue
         engine.sample_capital()
@@ -384,7 +384,7 @@ def start_replay_thread(engine: HydraEngine, replay_path: str, speed: float) -> 
 def start_capital_tracker_thread(engine: HydraEngine) -> threading.Thread:
     def runner():
         while not engine.run_control.stop_requested.is_set():
-            time.sleep(1.0)
+            time.sleep(0.2)
             if engine.run_control.live_paused.is_set():
                 continue
             engine.sample_capital()

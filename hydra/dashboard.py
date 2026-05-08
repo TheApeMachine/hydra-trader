@@ -174,7 +174,9 @@ class Dashboard:
         ax = self.ax_price
         ax.set_xlabel("seconds ago", fontsize=8, color="#999")
         self._style_axes(ax)
-        self.price_line, = ax.plot([], [], color="#3aa6ff", linewidth=1.4)
+        self.price_line, = ax.plot(
+            [], [], color="#3aa6ff", linewidth=1.4, drawstyle="steps-post"
+        )
         self.last_px_hline = ax.axhline(0, color="#3aa6ff", linewidth=0.5, alpha=0.4, linestyle="--")
         self.anchor_hline = ax.axhline(0, color="#f5b942", linewidth=0.8, alpha=0.7, linestyle=":")
         self.entry_hline = ax.axhline(0, color="#48d597", linewidth=0.8, alpha=0.7, linestyle="--")
@@ -277,7 +279,9 @@ class Dashboard:
         ax = self.ax_capital
         ax.set_xlabel("minutes ago", fontsize=8, color="#999")
         self._style_axes(ax)
-        self.cap_line, = ax.plot([], [], color="#48d597", linewidth=1.6)
+        self.cap_line, = ax.plot(
+            [], [], color="#48d597", linewidth=1.6, drawstyle="steps-post"
+        )
         self.cap_baseline = ax.axhline(self.cfg.start_capital, color="#888", linewidth=0.7, linestyle="--", alpha=0.7)
         self.cap_fill = PolyCollection([_EMPTY_POLY], facecolors="#48d597", alpha=0.18, edgecolors="none")
         ax.add_collection(self.cap_fill)
@@ -623,5 +627,5 @@ class Dashboard:
         return []
 
     def show(self):
-        self.ani = FuncAnimation(self.fig, self.update, interval=500, cache_frame_data=False)
+        self.ani = FuncAnimation(self.fig, self.update, interval=150, cache_frame_data=False)
         plt.show()

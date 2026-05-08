@@ -1,7 +1,7 @@
 REST = "https://api.kraken.com/0/public"
 WS = "wss://ws.kraken.com/v2"
 
-TOP_N = 150
+TOP_N = 300
 BOOK_N = 30
 BOOK_DEPTH = 10
 BOOK_STALE_SEC = 3.0

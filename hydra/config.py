@@ -66,7 +66,7 @@ class Config:
     macro_max_vol_x: float = 60.0
 
     # wallet / fills
-    start_capital: float = 20.0
+    start_capital: float = 200.0
     fee_pct: float = 0.0026
     slippage: float = 0.0005  # fallback only; L2 book-walk is preferred
     candidate_debounce_sec: float = 0.75
