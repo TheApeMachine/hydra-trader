@@ -1,0 +1,16 @@
+{
+    "name": "frontend",
+    "private": true,
+    "type": "module",
+    "imports": {
+        "#/*": "./src/*"
+    },
+    "scripts": {
+        "dev": "bun ./server.ts",
+        "typecheck": "bunx tsc --noEmit --strict false --target es2020 --module esnext --moduleResolution bundler --allowImportingTsExtensions --jsx react-jsx --skipLibCheck src/app.ts"
+    },
+    "dependencies": {
+        "scichart": "^5.2.11"
+    },
+    "devDependencies": {}
+}

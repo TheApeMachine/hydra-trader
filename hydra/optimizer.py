@@ -10,7 +10,6 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from .backtest import run_replay_backtest
 from .config import CANDIDATE_PARAMS_PATH, DEFAULT_PARAMS_PATH, Config, apply_params
 from .data import filter_paths_for_shared_read, list_recordings, replay_messages
 
@@ -20,6 +19,9 @@ try:
 except ImportError:  # pragma: no cover - depends on environment
     optuna = None
     OPTUNA_AVAILABLE = False
+
+
+VALIDATION_SHORTLIST_SIZE = 5
 
 
 class OptunaController:
@@ -202,6 +204,51 @@ class OptunaController:
             return 0.6 * min(scores) + 0.4 * mean_score
         return mean_score
 
+    @staticmethod
+    def _validation_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        metrics = [r.get("metrics", {}) for r in rows if isinstance(r.get("metrics"), dict)]
+        if not metrics:
+            return {
+                "recordings": 0,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "total_pnl": 0.0,
+                "mean_net_return": 0.0,
+                "min_net_return": 0.0,
+                "max_drawdown": 0.0,
+                "mean_return_per_hour": 0.0,
+                "mean_return_per_exposure_hour": 0.0,
+                "avg_hold_sec": 0.0,
+                "avg_return_velocity_pct_per_min": 0.0,
+            }
+
+        def f(m: dict[str, Any], key: str) -> float:
+            return float(m.get(key, 0.0) or 0.0)
+
+        trades = sum(int(m.get("trades", 0) or 0) for m in metrics)
+        wins = sum(int(m.get("wins", 0) or 0) for m in metrics)
+        losses = sum(int(m.get("losses", 0) or 0) for m in metrics)
+        net_returns = [f(m, "net_return") for m in metrics]
+        hold_weight = max(trades, len(metrics))
+
+        return {
+            "recordings": len(metrics),
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": wins / trades if trades else 0.0,
+            "total_pnl": sum(f(m, "total_pnl") for m in metrics),
+            "mean_net_return": sum(net_returns) / len(net_returns),
+            "min_net_return": min(net_returns),
+            "max_drawdown": max(f(m, "max_drawdown") for m in metrics),
+            "mean_return_per_hour": sum(f(m, "return_per_hour") for m in metrics) / len(metrics),
+            "mean_return_per_exposure_hour": sum(f(m, "return_per_exposure_hour") for m in metrics) / len(metrics),
+            "avg_hold_sec": sum(f(m, "avg_hold_sec") * int(m.get("trades", 0) or 0) for m in metrics) / hold_weight,
+            "avg_return_velocity_pct_per_min": sum(f(m, "avg_return_velocity_pct_per_min") for m in metrics) / len(metrics),
+        }
+
     def _run_segment(self, replay_path: str, cfg: Config, t_start: float, t_end: float, lower_inclusive: bool = True, symbol_sets=None) -> dict[str, Any]:
         from .clock import Clock, VirtualClock
         from .engine import HydraEngine
@@ -251,6 +298,21 @@ class OptunaController:
         cfg.micro_accel_threshold = trial.suggest_float("micro_accel_threshold", 1.0, 3.5)
         cfg.micro_delta_divergence = trial.suggest_float("micro_delta_divergence", 0.7, 2.8)
 
+        cfg.hawkes_enabled = trial.suggest_categorical("hawkes_enabled", [True, False])
+        cfg.hawkes_micro_gate = trial.suggest_categorical("hawkes_micro_gate", [True, False])
+        cfg.hawkes_decay_sec = trial.suggest_float("hawkes_decay_sec", 3.0, 20.0)
+        cfg.hawkes_impulse_cap = trial.suggest_float("hawkes_impulse_cap", 80.0, 500.0)
+        cfg.hawkes_self_excitation = trial.suggest_float("hawkes_self_excitation", 0.35, 0.95)
+        cfg.hawkes_cross_excitation = trial.suggest_float("hawkes_cross_excitation", 0.02, 0.35)
+        cfg.hawkes_branching_cap = trial.suggest_float("hawkes_branching_cap", 0.65, 0.98)
+        cfg.hawkes_min_buy_sell_ratio = trial.suggest_float("hawkes_min_buy_sell_ratio", 1.05, 2.60)
+        cfg.hawkes_min_excitation = trial.suggest_float("hawkes_min_excitation", 1.0, 14.0)
+        cfg.hawkes_min_slope = trial.suggest_float("hawkes_min_slope", -20.0, 25.0)
+        cfg.hawkes_exit_enabled = trial.suggest_categorical("hawkes_exit_enabled", [True, False])
+        cfg.hawkes_exit_min_age_sec = trial.suggest_float("hawkes_exit_min_age_sec", 4.0, 40.0)
+        cfg.hawkes_exit_sell_buy_ratio = trial.suggest_float("hawkes_exit_sell_buy_ratio", 1.02, 2.50)
+        cfg.hawkes_exit_max_ret = trial.suggest_float("hawkes_exit_max_ret", 0.002, 0.025)
+
         cfg.macro_min_tape_trades = trial.suggest_int("macro_min_tape_trades", 3, 15)
         cfg.macro_min_tape_notional = trial.suggest_float("macro_min_tape_notional", 1_000, 30_000, log=True)
         cfg.macro_min_tape_buy_share = trial.suggest_float("macro_min_tape_buy_share", 0.50, 0.68)
@@ -264,6 +326,7 @@ class OptunaController:
         cfg.vol_target_atr = trial.suggest_float("vol_target_atr", 0.005, 0.024)
         cfg.liq_buffer = trial.suggest_float("liq_buffer", 45_000, 450_000, log=True)
 
+        cfg.macro_thrust_enabled = trial.suggest_categorical("macro_thrust_enabled", [False, True])
         cfg.thrust_min_ret_3m = trial.suggest_float("thrust_min_ret_3m", 0.005, 0.025)
         cfg.thrust_min_ret_5m = trial.suggest_float("thrust_min_ret_5m", 0.010, 0.040)
         cfg.thrust_min_vol_x = trial.suggest_float("thrust_min_vol_x", 1.5, 6.0)
@@ -356,8 +419,8 @@ class OptunaController:
                     return_per_exposure_hours.append(m.get("return_per_exposure_hour", 0.0))
                     horizon_scores.append(m.get("horizon_score", 0.0))
                     trade_velocities.append(m.get("avg_return_velocity_pct_per_min", 0.0))
-                    weighted_hold_sec += float(m.get("avg_hold_sec", 0.0) or 0.0) * max(trades, 1)
-                    weighted_median_hold_sec += float(m.get("median_hold_sec", 0.0) or 0.0) * max(trades, 1)
+                    weighted_hold_sec += float(m.get("avg_hold_sec") or 0.0) * trades
+                    weighted_median_hold_sec += float(m.get("median_hold_sec") or 0.0) * trades
                 mean_score = sum(scores) / len(scores)
                 min_score = min(scores)
                 win_rate = (agg_wins / agg_trades) if agg_trades else 0.0
@@ -419,65 +482,160 @@ class OptunaController:
                 self._set(stage="done", message="done: no complete trials")
                 return
 
-            best_cfg = apply_params(dataclasses.replace(base_cfg), dict(best_trial.params))
             self._set(stage="validating", message="validating best params…")
-            val_scores = []
-            val_rows = []
             base_val_scores = []
+            base_val_rows = []
             for path, _t0, t_split, t_end in splits:
-                mv = self._run_segment(path, best_cfg, t_split, t_end, lower_inclusive=False, symbol_sets=symbol_cache.get(path))
-                sv = self._score(mv, best_cfg)
-                val_scores.append(sv)
-                val_rows.append({"file": os.path.basename(path), "score": sv, "metrics": mv})
                 mb = self._run_segment(path, base_cfg, t_split, t_end, lower_inclusive=False, symbol_sets=symbol_cache.get(path))
-                base_val_scores.append(self._score(mb, base_cfg))
+                sb = self._score(mb, base_cfg)
+                base_val_scores.append(sb)
+                base_val_rows.append({"file": os.path.basename(path), "score": sb, "metrics": mb})
 
-            cand_val_agg = self._aggregate(val_scores, robust_aggregate)
             base_val_agg = self._aggregate(base_val_scores, robust_aggregate)
+            base_val_summary = self._validation_summary(base_val_rows)
 
-            train_trades = int(best_trial.user_attrs.get("trades", 0) or 0)
-            val_trade_sum = sum(int(r["metrics"].get("trades", 0) or 0) for r in val_rows)
-            has_activity = train_trades >= 2 and val_trade_sum >= 1
-            beats_baseline = cand_val_agg > base_val_agg
-            promoted = bool(beats_baseline and has_activity)
+            completed_trials = [
+                t for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+            ]
+            shortlist = sorted(completed_trials, key=lambda t: float(t.value), reverse=True)[:VALIDATION_SHORTLIST_SIZE]
+            if not shortlist:
+                shortlist = [best_trial]
+
+            validated_candidates = []
+            for i, trial in enumerate(shortlist, 1):
+                self._set(
+                    stage="validating",
+                    message=f"validating candidate {i}/{len(shortlist)}…",
+                    current_trial=trial.number,
+                )
+                cfg = apply_params(dataclasses.replace(base_cfg), dict(trial.params))
+                val_scores = []
+                val_rows = []
+                for path, _t0, t_split, t_end in splits:
+                    mv = self._run_segment(path, cfg, t_split, t_end, lower_inclusive=False, symbol_sets=symbol_cache.get(path))
+                    sv = self._score(mv, cfg)
+                    val_scores.append(sv)
+                    val_rows.append({"file": os.path.basename(path), "score": sv, "metrics": mv})
+
+                val_summary = self._validation_summary(val_rows)
+                cand_val_agg = self._aggregate(val_scores, robust_aggregate)
+                train_trades = int(trial.user_attrs.get("trades", 0) or 0)
+                val_trade_sum = int(val_summary["trades"])
+                has_activity = train_trades >= 2 and val_trade_sum >= 1
+                beats_baseline = cand_val_agg > base_val_agg
+                beats_baseline_return = val_summary["mean_net_return"] > base_val_summary["mean_net_return"]
+                validated_candidates.append({
+                    "trial_number": trial.number,
+                    "train_score": trial.value,
+                    "train_attrs": dict(trial.user_attrs),
+                    "params": dict(trial.params),
+                    "validation_scores": val_scores,
+                    "validation_by_recording": val_rows,
+                    "validation_aggregate": cand_val_agg,
+                    "validation_summary": val_summary,
+                    "promotion_gate": {
+                        "train_trades": train_trades,
+                        "val_trade_sum": val_trade_sum,
+                        "beats_baseline": beats_baseline,
+                        "beats_baseline_return": beats_baseline_return,
+                        "has_min_activity": has_activity,
+                    },
+                })
+
+            def candidate_rank(row: dict[str, Any]) -> tuple[bool, float, float]:
+                gate = row["promotion_gate"]
+                promotable = bool(gate["beats_baseline"] and gate["beats_baseline_return"] and gate["has_min_activity"])
+                return (
+                    promotable,
+                    float(row["validation_aggregate"]),
+                    float(row["validation_summary"]["mean_net_return"]),
+                )
+
+            selected = max(validated_candidates, key=candidate_rank)
+            selected_gate = selected["promotion_gate"]
+            selected_summary = selected["validation_summary"]
+            selected_trial_number = int(selected["trial_number"])
+            cand_val_agg = float(selected["validation_aggregate"])
+            val_scores = selected["validation_scores"]
+            val_rows = selected["validation_by_recording"]
+
+            has_activity = bool(selected_gate["has_min_activity"])
+            beats_baseline = bool(selected_gate["beats_baseline"])
+            beats_baseline_return = bool(selected_gate["beats_baseline_return"])
+            promoted = bool(beats_baseline and beats_baseline_return and has_activity)
 
             out = {
                 "study_name": "hydra_v5_independent",
-                "best_score": study.best_value,
-                "best_params": dict(best_trial.params),
-                "best_train_attrs": dict(best_trial.user_attrs),
+                "best_score": selected["train_score"],
+                "best_trial": selected_trial_number,
+                "best_params": dict(selected["params"]),
+                "best_train_attrs": dict(selected["train_attrs"]),
                 "best_validation_scores": val_scores,
                 "best_validation_by_recording": val_rows,
                 "best_validation_aggregate": cand_val_agg,
+                "best_validation_summary": selected_summary,
                 "baseline_validation_scores": base_val_scores,
+                "baseline_validation_by_recording": base_val_rows,
                 "baseline_validation_aggregate": base_val_agg,
+                "baseline_validation_summary": base_val_summary,
+                "validated_candidate_trials": [
+                    {
+                        "trial_number": row["trial_number"],
+                        "train_score": row["train_score"],
+                        "validation_aggregate": row["validation_aggregate"],
+                        "validation_scores": row["validation_scores"],
+                        "validation_summary": row["validation_summary"],
+                        "promotion_gate": row["promotion_gate"],
+                    }
+                    for row in validated_candidates
+                ],
+                "study_best_trial": best_trial.number,
+                "study_best_score": study.best_value,
                 "promoted_to_best": promoted,
                 "promotion_gate": {
-                    "train_trades": train_trades,
-                    "val_trade_sum": val_trade_sum,
+                    "train_trades": selected_gate["train_trades"],
+                    "val_trade_sum": selected_gate["val_trade_sum"],
                     "beats_baseline": beats_baseline,
+                    "beats_baseline_return": beats_baseline_return,
                     "has_min_activity": has_activity,
                 },
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "replay_paths": list(replay_paths),
                 "robust_aggregate": robust_aggregate,
+                "validation_shortlist_size": VALIDATION_SHORTLIST_SIZE,
             }
             CANDIDATE_PARAMS_PATH.write_text(json.dumps(out, indent=2, default=str))
             if promoted:
                 DEFAULT_PARAMS_PATH.write_text(json.dumps(out, indent=2, default=str))
-                msg = f"done — candidate beat baseline ({cand_val_agg:.4f} > {base_val_agg:.4f}) with activity; wrote {DEFAULT_PARAMS_PATH.resolve()}"
+                msg = (
+                    f"done — trial {selected_trial_number} beat baseline "
+                    f"({cand_val_agg:.4f} > {base_val_agg:.4f}) with better validation return; "
+                    f"wrote {DEFAULT_PARAMS_PATH.resolve()}"
+                )
             else:
                 reason = []
                 if not beats_baseline:
                     reason.append(f"score {cand_val_agg:.4f} ≤ baseline {base_val_agg:.4f}")
+                if not beats_baseline_return:
+                    reason.append(
+                        "return "
+                        f"{selected_summary['mean_net_return']:.4f} ≤ baseline "
+                        f"{base_val_summary['mean_net_return']:.4f}"
+                    )
                 if not has_activity:
-                    reason.append(f"insufficient trades (train={train_trades}, val_sum={val_trade_sum})")
+                    reason.append(
+                        "insufficient trades "
+                        f"(train={selected_gate['train_trades']}, val_sum={selected_gate['val_trade_sum']})"
+                    )
                 msg = f"done — NOT promoted ({'; '.join(reason)}); wrote {CANDIDATE_PARAMS_PATH.resolve()} only"
             print("[OPTUNA]", msg)
             self._set(
                 stage="done",
                 message=msg,
                 promoted=promoted,
+                best_trial=selected_trial_number,
+                best_score=selected["train_score"],
                 candidate_validation_aggregate=cand_val_agg,
                 baseline_validation_aggregate=base_val_agg,
             )
@@ -585,6 +743,3 @@ class AutoOptunaWatcher:
                 print(f"[AUTO_OPTUNA] started on {info} ({note})")
             else:
                 print(f"[AUTO_OPTUNA] could not start: {info}")
-
-
-

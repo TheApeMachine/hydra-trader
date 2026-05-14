@@ -13,6 +13,7 @@ from .config import Config
 from .constants import BTC_SYMBOL
 from .market import MarketStore
 from .utils import candle_close_pos_dict, clamp, close_position, iso_from_ts, median
+from .adaptive_context import AdaptiveContext
 
 
 @dataclasses.dataclass
@@ -20,6 +21,16 @@ class TraderHooks:
     candidate_expired: Callable[[int], None] = lambda n: None
     candidate_rejected: Callable[[int], None] = lambda n: None
     fill: Callable[[], None] = lambda: None
+
+
+# horizon_score weights: net return and velocity boost score; drawdown and hold time penalize.
+HORIZON_WEIGHT_NET_RETURN = 100.0
+HORIZON_WEIGHT_RETURN_PER_HOUR = 35.0
+HORIZON_WEIGHT_RETURN_PER_EXPOSURE_HOUR = 20.0
+HORIZON_WEIGHT_AVG_TRADE_VELOCITY = 20.0
+HORIZON_WEIGHT_MAX_DRAWDOWN = 120.0
+HORIZON_WEIGHT_AVG_HOLD_MIN = 0.60
+HORIZON_WEIGHT_MEDIAN_HOLD_MIN = 0.40
 
 
 class HydraTrader:
@@ -59,9 +70,24 @@ class HydraTrader:
         self.micro_exit_cooldown: dict[str, float] = {}
         self.micro_candidate_cooldown: dict[str, float] = {}
         self.hooks = hooks or TraderHooks()
+        self.adaptive_ctx = AdaptiveContext(cfg) if cfg.adaptive_enabled else None
 
     def now(self) -> float:
         return self.clock.now()
+
+    def _adapt_maybe_refresh(self) -> None:
+        if self.adaptive_ctx:
+            self.adaptive_ctx.maybe_refresh(self.now(), self.market, self.market.trade_symbols)
+
+    def _effective_micro_vs_cost_floor(self) -> float:
+        if self.adaptive_ctx:
+            return self.adaptive_ctx.effective_micro_vs_cost_floor(self.cfg.micro_vs_cost_floor)
+        return self.cfg.micro_vs_cost_floor
+
+    def _effective_thrust_ret_vs_floor(self) -> float:
+        if self.adaptive_ctx:
+            return self.adaptive_ctx.effective_thrust_ret_vs_floor(self.cfg.thrust_ret_vs_floor)
+        return self.cfg.thrust_ret_vs_floor
 
     # ── wallet / fills ──────────────────────────────────
     def _check_daily_loss(self, mark: float | None = None) -> bool:
@@ -146,7 +172,10 @@ class HydraTrader:
             top_not = sum(p * q for p, q in self.market.top_bids(symbol, 5))
             liq_factor = min(1.0, top_not / self.cfg.liq_buffer)
 
-        score_factor = clamp(score / 9.0, 0.65, 1.35)
+        # Wider swing: tepid scores size down; strong scores unchanged at the top.
+        score_factor = clamp(score / 9.0, 0.48, 1.35)
+        if self.adaptive_ctx:
+            score_factor *= self.adaptive_ctx.score_size_boost()
         raw = base * vol_factor * liq_factor * score_factor
         size = max(min_ticket, raw)
         size = min(size, max_by_cash, max_by_heat)
@@ -190,6 +219,83 @@ class HydraTrader:
             w.writerow(rec)
             f.flush()
 
+    def _price_for_net_ret(self, target_ret: float) -> float:
+        if not self.pos:
+            return 0.0
+
+        denom = self.pos["qty"] * (1 - self.cfg.slippage) * (1 - self.cfg.fee_pct)
+        if denom <= 0:
+            return 0.0
+        return self.pos["entry_cost"] * (1.0 + target_ret) / denom
+
+    def _raise_paper_stop(self, price: float, reason: str, source: str) -> None:
+        if not self.cfg.paper_stop_orders_enabled or not self.pos or price <= 0:
+            return
+
+        current = float(self.pos.get("stop_price") or 0.0)
+        if current <= 0 or price > current:
+            self.pos["stop_price"] = price
+            self.pos["stop_reason"] = reason
+            self.pos["stop_source"] = source
+            self.pos["stop_updated_at"] = self.now()
+
+    def _install_initial_paper_stop(self) -> None:
+        if not self.cfg.paper_stop_orders_enabled or not self.pos:
+            return
+
+        r = self.cfg.risk(self.pos["regime"])
+        stop_px = self._price_for_net_ret(-float(r["hard_stop"]))
+        self._raise_paper_stop(stop_px, "hard_stop_net", "initial")
+
+    def _sync_paper_stop(self, mark: float, net_ret: float, r: dict[str, float], age: float) -> None:
+        if not self.cfg.paper_stop_orders_enabled or not self.pos:
+            return
+
+        if not self.pos.get("stop_price"):
+            self._install_initial_paper_stop()
+
+        if not self.pos["trail_active"] and net_ret >= r["trail_activate"]:
+            self.pos["trail_active"] = True
+
+            if self.verbose:
+                t = datetime.now().strftime("%H:%M:%S")
+                print(f"[{t}] [{self.name:12s}] Trail ON {self.pos['pair']} net {net_ret*100:+.2f}%")
+
+        if not self.pos["trail_active"]:
+            return
+
+        trail_pct = r["trail_pct"]
+        reason = "trail"
+        tightens_at = min(float(r["max_hold"]) * 0.55, self.cfg.horizon_trail_tighten_sec)
+        if age >= tightens_at and net_ret > self.cfg.time_efficiency_min_ret:
+            trail_pct = min(trail_pct, self.cfg.horizon_tight_trail_pct)
+            if trail_pct < r["trail_pct"]:
+                reason = "horizon_tight_trail"
+
+        stop_px = self.pos["peak_mark"] * (1 - trail_pct)
+        self._raise_paper_stop(stop_px, reason, "trailing")
+
+    def _paper_stop_triggered(self, mark: float) -> bool:
+        if not self.cfg.paper_stop_orders_enabled or not self.pos:
+            return False
+        stop_px = float(self.pos.get("stop_price") or 0.0)
+        return stop_px > 0 and mark <= stop_px
+
+    def _paper_stop_reason(self) -> str:
+        if not self.pos:
+            return "paper_stop"
+        return str(self.pos.get("stop_reason") or "paper_stop")
+
+    def _paper_stop_candle_fill(self, low: float) -> float:
+        if not self.pos:
+            return 0.0
+        stop_px = float(self.pos.get("stop_price") or 0.0)
+        if stop_px <= 0:
+            return 0.0
+        if self.cfg.paper_stop_gap_fill:
+            return min(stop_px, low) if low > 0 else stop_px
+        return stop_px
+
     def _enter(self, pair: str, signal_price: float, regime: str, score: float, note: str = "") -> None:
         if signal_price <= 0 or self.cash <= 0:
             return
@@ -222,6 +328,7 @@ class HydraTrader:
             "score": score,
             "note": note,
         }
+        self._install_initial_paper_stop()
         
         self.cash -= qty_cap
         self.market.mark_entry(self.now(), pair, fill, regime)
@@ -236,12 +343,15 @@ class HydraTrader:
         
         self.hooks.fill()
 
-    def _exit(self, signal_price: float, reason: str) -> None:
+    def _exit(self, signal_price: float, reason: str, force_signal_fill: bool = False) -> None:
         if not self.pos or signal_price <= 0:
             return
         
         pair = self.pos["pair"]
-        gross_proceeds = self.market.estimate_taker_sell_fill(pair, self.pos["qty"])
+        if force_signal_fill:
+            gross_proceeds = self.pos["qty"] * signal_price * (1 - self.cfg.slippage)
+        else:
+            gross_proceeds = self.market.estimate_taker_sell_fill(pair, self.pos["qty"])
         
         if gross_proceeds <= 0:
             gross_proceeds = self.pos["qty"] * signal_price * (1 - self.cfg.slippage)
@@ -272,10 +382,17 @@ class HydraTrader:
             "return_velocity_pct_per_min": return_velocity_per_min * 100.0,
             "capital_after": self.cash,
             "note": self.pos["note"],
+            "stop_price": self.pos.get("stop_price"),
+            "stop_reason": self.pos.get("stop_reason"),
+            "stop_source": self.pos.get("stop_source"),
         }
         
         self.trades.append(rec)
-        
+
+        if self.adaptive_ctx:
+            self.adaptive_ctx.note_close(self.now(), trade_ret)
+            self.adaptive_ctx.maybe_refresh(self.now(), self.market, self.market.trade_symbols)
+
         if self.csv_enabled:
             try:
                 self._csv_append(rec)
@@ -311,7 +428,9 @@ class HydraTrader:
     def execute_due(self) -> None:
         if self.pos:
             return
-        
+
+        self._adapt_maybe_refresh()
+
         tnow = self.now()
         
         for c in self.candidates.values():
@@ -354,7 +473,7 @@ class HydraTrader:
                 sp = self.market.spread_bps(symbol)
                 imb = self.market.book_imbalance(symbol, 5)
         
-                if sp is None or imb is None or sp > cand.get("max_spread_bps", 12.0) or imb < 1.05:
+                if sp is None or imb is None or sp > cand.get("max_spread_bps", 12.0) or imb < 1.0:
                     self.hooks.candidate_rejected(1)
                     continue
             elif self.cfg.macro_require_microstructure and not self.market.live_microstructure_ok(symbol):
@@ -383,11 +502,18 @@ class HydraTrader:
 
         r = self.cfg.risk(self.pos["regime"])
         net_ret = self.net_ret_if_exit(mark)
+        age = self.now() - self.pos["entry_time"]
 
         if mark > self.pos["peak_mark"]:
             self.pos["peak_mark"] = mark
 
-        if net_ret <= -r["hard_stop"]:
+        self._sync_paper_stop(mark, net_ret, r, age)
+
+        if self._paper_stop_triggered(mark):
+            self._exit(mark, self._paper_stop_reason())
+            return
+
+        if not self.cfg.paper_stop_orders_enabled and net_ret <= -r["hard_stop"]:
             self._exit(mark, "hard_stop_net")
             return
 
@@ -395,7 +521,6 @@ class HydraTrader:
             self._exit(mark, "take_profit")
             return
 
-        age = self.now() - self.pos["entry_time"]
         age_min = max(age / 60.0, 1.0 / 60.0)
         return_velocity_per_min = net_ret / age_min
         
@@ -417,7 +542,7 @@ class HydraTrader:
             self._exit(mark, "return_velocity_stall")
             return
 
-        if not self.pos["trail_active"] and net_ret >= r["trail_activate"]:
+        if not self.cfg.paper_stop_orders_enabled and not self.pos["trail_active"] and net_ret >= r["trail_activate"]:
             self.pos["trail_active"] = True
         
             if self.verbose:
@@ -429,7 +554,7 @@ class HydraTrader:
         if age >= tightens_at and net_ret > self.cfg.time_efficiency_min_ret:
             trail_pct = min(trail_pct, self.cfg.horizon_tight_trail_pct)
 
-        if self.pos["trail_active"] and mark <= self.pos["peak_mark"] * (1 - trail_pct):
+        if not self.cfg.paper_stop_orders_enabled and self.pos["trail_active"] and mark <= self.pos["peak_mark"] * (1 - trail_pct):
             reason = "horizon_tight_trail" if trail_pct < r["trail_pct"] else "trail"
             self._exit(mark, reason)
             return
@@ -445,6 +570,13 @@ class HydraTrader:
             if age > 25 and imb is not None and sp is not None and imb < 0.70 and net_ret < 0.010:
                 self._exit(mark, "book_flip")
                 return
+
+            if self.cfg.hawkes_enabled and self.cfg.hawkes_exit_enabled and age >= self.cfg.hawkes_exit_min_age_sec:
+                snap = self.market.snapshot_micro(symbol)
+                sell_buy = float(snap.get("hawkes_sell_buy_ratio") or 0.0) if snap else 0.0
+                if sell_buy >= self.cfg.hawkes_exit_sell_buy_ratio and net_ret < self.cfg.hawkes_exit_max_ret:
+                    self._exit(mark, "hawkes_sell_flip")
+                    return
 
         if self.pos and age >= r["stall_check"] and net_ret < r["stall_ret"]:
             self._exit(mark, "stall_net")
@@ -609,8 +741,13 @@ class HydraTrader:
             })
 
     def maybe_thrust_candidate(self, symbol: str, c: dict[str, Any], minute_key: Any) -> None:
+        if not self.cfg.macro_thrust_enabled:
+            return
+
         if self.pos or not self.market.btc_context_ok(strict=False):
             return
+
+        self._adapt_maybe_refresh()
 
         hist = self.market.latest_closed(symbol)
         
@@ -650,13 +787,13 @@ class HydraTrader:
         
         candle_ret = c["close"] / c["open"] - 1.0 if c["open"] > 0 else 0.0
         
-        if candle_ret < 0.004:
+        if candle_ret < 0.0025:
             return
-        
+
         if not self.market.book_quality_ok(symbol, max_spread_bps=self.cfg.macro_max_spread_bps, min_imbalance=self.cfg.macro_min_book_imbalance, require_book=self.cfg.macro_require_microstructure):
             return
         
-        if abs(r5) < self.market.estimated_cost_floor(symbol) * 1.5:
+        if abs(r5) < self.market.estimated_cost_floor(symbol) * self._effective_thrust_ret_vs_floor():
             return
 
         sp = self.market.spread_bps(symbol)
@@ -737,9 +874,20 @@ class HydraTrader:
         buy_share = snap["buy_not"] / max(flow, 1.0)
         delta_div = buy_share / max(snap.get("baseline_buy_share", 0.5), 0.05)
         ms = snap.get("max_spread", 18.0)
+        hawkes_ratio = float(snap.get("hawkes_buy_sell_ratio") or 0.0)
+        hawkes_excitation = float(snap.get("hawkes_excitation") or 0.0)
+        hawkes_slope = float(snap.get("hawkes_slope") or 0.0)
 
-        if move_pct < self.market.estimated_cost_floor(symbol) * 0.75:
+        if move_pct < self.market.estimated_cost_floor(symbol) * self._effective_micro_vs_cost_floor():
             return
+
+        if self.cfg.hawkes_enabled and self.cfg.hawkes_micro_gate:
+            if (
+                hawkes_ratio < self.cfg.hawkes_min_buy_sell_ratio
+                or hawkes_excitation < self.cfg.hawkes_min_excitation
+                or hawkes_slope < self.cfg.hawkes_min_slope
+            ):
+                return
 
         if (
             snap["burst_ratio"] >= self.cfg.micro_burst_multiple
@@ -747,7 +895,7 @@ class HydraTrader:
             and move_pct >= self.cfg.micro_min_move_pct
             and accel >= self.cfg.micro_accel_threshold
             and delta_div >= self.cfg.micro_delta_divergence
-            and snap["book_imb"] is not None and snap["book_imb"] >= 1.08
+            and snap["book_imb"] is not None and snap["book_imb"] >= 1.01
             and snap["spread_bps"] is not None and snap["spread_bps"] <= ms
         ):
             score = (
@@ -757,6 +905,8 @@ class HydraTrader:
                 + 1.8 * clamp(accel / 2.5)
                 + 1.4 * clamp((snap["book_imb"] - 1.0) / 0.8)
                 + 0.7 * clamp(delta_div / 1.8)
+                + 0.8 * clamp((hawkes_ratio - 1.0) / 2.0)
+                + 0.6 * clamp(hawkes_excitation / 4.0)
                 - 0.7 * clamp(snap["spread_bps"] / ms)
             )
 
@@ -765,10 +915,10 @@ class HydraTrader:
                 "price": dq[-1][2],
                 "regime": "book_ignition",
                 "score": score,
-                "note": f"micro {accel:.2f}x Δ{delta_div:.2f}",
+                "note": f"micro {accel:.2f}x Δ{delta_div:.2f} hx {hawkes_ratio:.2f}/{hawkes_excitation:.1f}/{hawkes_slope:+.1f}",
                 "at": tnow,
-                "max_chase": 0.005,
-                "fail_drop": 0.004,
+                "max_chase": 0.008,
+                "fail_drop": 0.006,
                 "max_spread_bps": ms,
             })
             
@@ -789,6 +939,12 @@ class HydraTrader:
                 self.watch.pop(symbol, None)
 
         if self.pos and self.pos["pair"] == symbol:
+            if self.market.ohlc_only and self.cfg.paper_stop_orders_enabled:
+                low = float(c.get("low") or 0.0)
+                if low > 0 and self._paper_stop_triggered(low):
+                    self._exit(self._paper_stop_candle_fill(low), self._paper_stop_reason(), force_signal_fill=True)
+                    return
+
             self.on_tick(symbol, c["close"])
         
             if not self.pos:
@@ -820,7 +976,7 @@ class HydraTrader:
 
     def summary_metrics(self, n_msgs: int = 0) -> dict[str, Any]:
         final = self.cash if not self.pos else self.capital_now()
-        pnls = [float(t["pnl_usd"]) for t in self.trades]
+        pnls = [float(t.get("pnl_usd", 0.0) or 0.0) for t in self.trades]
         wins = sum(1 for p in pnls if p > 0)
         total = len(pnls)
         total_pnl = sum(pnls)
@@ -895,16 +1051,16 @@ class HydraTrader:
         avg_hold_min = avg_hold_sec / 60.0
         median_hold_min = median_hold_sec / 60.0
         horizon_score = (
-            100.0 * net_return
-            + 35.0 * return_per_hour
-            + 20.0 * return_per_exposure_hour
-            + 20.0 * avg_trade_velocity
-            - 120.0 * max_dd
-            - 0.60 * avg_hold_min
-            - 0.40 * median_hold_min
+            HORIZON_WEIGHT_NET_RETURN * net_return
+            + HORIZON_WEIGHT_RETURN_PER_HOUR * return_per_hour
+            + HORIZON_WEIGHT_RETURN_PER_EXPOSURE_HOUR * return_per_exposure_hour
+            + HORIZON_WEIGHT_AVG_TRADE_VELOCITY * avg_trade_velocity
+            - HORIZON_WEIGHT_MAX_DRAWDOWN * max_dd
+            - HORIZON_WEIGHT_AVG_HOLD_MIN * avg_hold_min
+            - HORIZON_WEIGHT_MEDIAN_HOLD_MIN * median_hold_min
         )
 
-        return {
+        metrics = {
             "messages": n_msgs,
             "trades": total,
             "wins": wins,
@@ -939,9 +1095,19 @@ class HydraTrader:
             "by_regime": by_regime_out,
         }
 
+        if self.adaptive_ctx and self.adaptive_ctx.last_snap:
+            ls = self.adaptive_ctx.last_snap
+            metrics["adaptive_relax"] = ls.relax
+            metrics["adaptive_opportunity"] = ls.opportunity_raw
+            metrics["adaptive_stress"] = ls.stress_raw
+            metrics["adaptive_window_trades"] = ls.n_trades_window
+            metrics["adaptive_micro_samples_ok"] = ls.samples_ok
+
+        return metrics
+
     def performance_snapshot(self, n_msgs: int = 0) -> dict[str, Any]:
         m = self.summary_metrics(n_msgs)
-        return {
+        out = {
             "net_return": m["net_return"],
             "return_per_hour": m["return_per_hour"],
             "return_per_exposure_hour": m["return_per_exposure_hour"],
@@ -953,4 +1119,14 @@ class HydraTrader:
             "avg_return_velocity_pct_per_min": m["avg_return_velocity_pct_per_min"],
             "trades": m["trades"],
         }
+        for ak in (
+            "adaptive_relax",
+            "adaptive_opportunity",
+            "adaptive_stress",
+            "adaptive_window_trades",
+            "adaptive_micro_samples_ok",
+        ):
+            if ak in m:
+                out[ak] = m[ak]
 
+        return out

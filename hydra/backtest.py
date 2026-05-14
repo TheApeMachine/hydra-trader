@@ -166,5 +166,3 @@ def run_historical_backtest(symbols: list[str] | None = None, interval: int = 1,
         print(json.dumps(metrics, indent=2, default=str))
     return metrics
 
-
-

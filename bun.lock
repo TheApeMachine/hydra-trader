@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "frontend",
+      "dependencies": {
+        "scichart": "^5.2.11",
+      },
+    },
+  },
+  "packages": {
+    "scichart": ["scichart@5.2.11", "", {}, "sha512-NKNBCg0hAfZ9sNIrg2wtGdTuG71Z/uGFjkjnKR+dj+FjCxt/t4rRMQR3r0nNIF63S6ISUrsY95CioWZ0sd7TGA=="],
+  }
+}

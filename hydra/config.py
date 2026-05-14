@@ -54,30 +54,52 @@ def _try_fallback_relaxed(quiet: bool) -> tuple[Config, str]:
 class Config:
     """Tunable strategy parameters.
 
-    These defaults are intentionally more defensive than the early prototype:
-    macro entries must move quickly, risk is capped, and live macro signals
-    require fresh L2/tape confirmation in the strategy layer.
+    Default numeric gates bias toward setups that clear estimated round-trip
+    friction (fees + spread model), rather than shaving marginal moves. Overrides
+    still go through JSON (``hydra_best.json`` etc.). Macro tape/L2 coupling defaults
+    off so hourly signals are not gated on simultaneous tape bursts.
     """
 
     # tape window + micro/book_ignition
     tape_window_sec: float = 12.0
     tape_baseline_sec: float = 240.0
-    micro_min_trades: int = 12
-    micro_min_buy_notional: float = 45_000.0
-    micro_burst_multiple: float = 4.5
-    micro_min_imbalance: float = 2.2
-    micro_min_move_pct: float = 0.005
+    micro_min_trades: int = 6
+    micro_min_buy_notional: float = 4_000.0  # loosened — was 45k; still meaningful filter
+    micro_burst_multiple: float = 2.8
+    micro_min_imbalance: float = 1.55
+    micro_min_move_pct: float = 0.0035
+    # move must clear this × estimated round-trip friction (spread+fees) to micro-scalp
+    micro_vs_cost_floor: float = 0.82
     micro_breakout_eps: float = 0.00035
-    micro_cooldown_sec: float = 75.0
-    micro_candidate_cooldown_sec: float = 3.5
-    micro_accel_threshold: float = 1.75
-    micro_delta_divergence: float = 1.22
+    micro_cooldown_sec: float = 40.0
+    micro_candidate_cooldown_sec: float = 2.0
+    micro_accel_threshold: float = 1.2
+    micro_delta_divergence: float = 1.08
+
+    # Online marked Hawkes-style tape excitation. This is a small two-sided
+    # intensity model (buy/sell self + cross excitation), not a full batch MLE.
+    hawkes_enabled: bool = True
+    hawkes_micro_gate: bool = True
+    hawkes_decay_sec: float = 8.0
+    hawkes_impulse_cap: float = 260.0
+    hawkes_self_excitation: float = 0.82
+    hawkes_cross_excitation: float = 0.12
+    hawkes_branching_cap: float = 0.94
+    hawkes_prediction_interval_sec: float = 1.0
+    hawkes_prediction_horizon_sec: float = 60.0
+    hawkes_min_buy_sell_ratio: float = 1.35
+    hawkes_min_excitation: float = 8.0
+    hawkes_min_slope: float = 0.0
+    hawkes_exit_enabled: bool = False
+    hawkes_exit_min_age_sec: float = 8.0
+    hawkes_exit_sell_buy_ratio: float = 1.18
+    hawkes_exit_max_ret: float = 0.012
 
     # macro pump-pullback-reclaim
-    baseline_mins: int = 20
-    min_spike_pct: float = 7.0
-    vol_burst_x: float = 4.8
-    pump_candle_upper_pct: float = 0.70
+    baseline_mins: int = 15
+    min_spike_pct: float = 5.0
+    vol_burst_x: float = 3.2
+    pump_candle_upper_pct: float = 0.65
     cooldown_sec: float = 360.0
     watch_max_age: float = 3600.0
     peak_update_window: float = 360.0
@@ -85,36 +107,44 @@ class Config:
     pullback_max: float = 0.175
     invalidate_drop: float = 0.24
     reclaim_lookback: int = 4
-    reclaim_vol_floor: float = 1.18
+    reclaim_vol_floor: float = 1.06
 
     # thrust
+    macro_thrust_enabled: bool = False
     thrust_lookback: int = 20
-    thrust_min_ret_3m: float = 0.011
-    thrust_min_ret_5m: float = 0.019
-    thrust_max_ret_5m: float = 0.11
-    thrust_min_vol_x: float = 2.8
-    thrust_min_close_pos: float = 0.76
+    thrust_min_ret_3m: float = 0.0065
+    thrust_min_ret_5m: float = 0.011
+    thrust_max_ret_5m: float = 0.12
+    thrust_min_vol_x: float = 1.85
+    thrust_min_close_pos: float = 0.62
+    thrust_ret_vs_floor: float = 1.18  # |r5| must exceed floor × this (spread+fee model)
 
-    # macro live microstructure confirmation
-    macro_require_microstructure: bool = True
-    macro_min_tape_trades: int = 6
-    macro_min_tape_notional: float = 15_000.0
-    macro_min_tape_buy_share: float = 0.54
-    macro_max_spread_bps: float = 18.0
-    macro_min_book_imbalance: float = 0.85
-    macro_max_vol_x: float = 60.0
+    # macro live microstructure confirmation (candidate generation — off by default)
+    macro_require_microstructure: bool = False
+    macro_min_tape_trades: int = 4
+    macro_min_tape_notional: float = 4_500.0
+    macro_min_tape_buy_share: float = 0.51
+    macro_max_spread_bps: float = 42.0
+    macro_min_book_imbalance: float = 0.72
+    macro_max_vol_x: float = 80.0
 
     # wallet / fills
     start_capital: float = 200.0
     fee_pct: float = 0.0026
     slippage: float = 0.0005  # fallback only; L2 book-walk is preferred
-    candidate_debounce_sec: float = 0.75
-    max_candidate_age: float = 8.0
+    candidate_debounce_sec: float = 0.5
+    max_candidate_age: float = 35.0
+    book_stale_sec: float = 22.0  # multiplexed feeds: allow slower L2 inter-arrival
     max_portfolio_heat: float = 0.50
     daily_loss_limit: float = 0.115
     vol_target_atr: float = 0.012
     liq_buffer: float = 160_000.0
     min_ticket_usd: float = 8.0
+
+    # Paper-wallet stop orders. These simulate long stop-market orders in the
+    # wallet/backtester; they are not exchange-native orders.
+    paper_stop_orders_enabled: bool = True
+    paper_stop_gap_fill: bool = True
 
     # risk: book_ignition
     bi_hard_stop: float = 0.028
@@ -156,6 +186,31 @@ class Config:
     horizon_trail_tighten_sec: float = 360.0
     horizon_tight_trail_pct: float = 0.008
 
+    # adaptive runtime — microstructure/Tape/BTC cues + rolling returns modulate friction gates (on by default)
+    adaptive_enabled: bool = True
+    adaptive_refresh_sec: float = 25.0
+    adaptive_perf_window_sec: float = 14400.0
+    adaptive_min_trades_in_window: int = 4
+    adaptive_smooth_alpha: float = 0.16
+    adaptive_relax_max_step: float = 0.065
+    adaptive_stress_damping: float = 0.55
+    adaptive_micro_floor_span: float = 0.10
+    adaptive_thrust_floor_span: float = 0.08
+    adaptive_score_size_span: float = 0.055
+    adaptive_micro_floor_hard_min: float = 0.56
+    adaptive_micro_floor_hard_max: float = 0.96
+    adaptive_thrust_floor_hard_min: float = 1.02
+    adaptive_thrust_floor_hard_max: float = 1.26
+    adaptive_score_size_hard_min: float = 0.90
+    adaptive_score_size_hard_max: float = 1.085
+    adaptive_micro_sample_syms: int = 14
+    adaptive_opp_weight_spread: float = 0.28
+    adaptive_opp_weight_tape: float = 0.24
+    adaptive_opp_weight_flow: float = 0.20
+    adaptive_opp_weight_btc: float = 0.28
+    adaptive_stress_underperf_den: float = 0.018
+    adaptive_stress_loss_frac_ref: float = 0.62
+
     def risk(self, regime: str) -> dict[str, float]:
         if regime == "book_ignition":
             return {
@@ -195,8 +250,18 @@ class Config:
 
 def apply_params(cfg: Config, params: dict[str, Any] | None) -> Config:
     fields = {f.name: f.type for f in dataclasses.fields(cfg)}
+    params = params or {}
+
+    # Compatibility for tuned files created before the explicit thrust switch.
+    # If a params file tuned thrust-specific fields, preserve that behavior
+    # unless it opts out with macro_thrust_enabled=false.
+    if "macro_thrust_enabled" not in params and any(
+        key.startswith("thrust_") or key.startswith("mt_")
+        for key in params
+    ):
+        cfg.macro_thrust_enabled = True
     
-    for key, value in (params or {}).items():
+    for key, value in params.items():
         if key not in fields:
             continue
     
@@ -252,10 +317,10 @@ def maybe_load_config(
 
         if not quiet:
             print(f"Loaded tuned params from {target.resolve()}")
+            print(
+                "  Hint: pass `--no-params` to skip JSON and use the repo’s exploratory built-in gates."
+            )
 
         return cfg, source
 
     return Config(), "defaults"
-
-
-

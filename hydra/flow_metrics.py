@@ -106,5 +106,3 @@ def format_lines(flow: dict[str, Any]) -> list[str]:
         f"turbulence (var log ret): {tu:.2e}",
     ]
 
-
-

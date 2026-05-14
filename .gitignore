@@ -8,6 +8,11 @@ hydra_relaxed.json
 trades_hydra_dash.csv
 runs/2026-05-08_1810.jsonl
 runs/2026-05-08_2239.jsonl
-hydra_relaxed.json
-runs/live_2026-05-09_0020.jsonl
-runs/live_2026-05-09_0045.jsonl
+runs/live_*.jsonl
+.DS_Store
+__pycache__/
+venv/
+.venv/
+.pytest_cache/
+node_modules/
+runs/

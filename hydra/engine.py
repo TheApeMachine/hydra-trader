@@ -124,6 +124,13 @@ class HydraEngine:
         self.trader = HydraTrader(cfg, self.market, self.clock, name=name, csv_enabled=csv_enabled, verbose=verbose, hooks=hooks)
         self.verbose = verbose
         self.n_messages = 0
+        self._tape_first_trade_logged: set[str] = set()
+        self._tape_drop_logged: set[str] = set()
+
+    def _reset_tape_ingest_logging(self) -> None:
+        """Call on each websocket session so first-trade / drop traces reflect reconnects."""
+        self._tape_first_trade_logged.clear()
+        self._tape_drop_logged.clear()
 
     def set_symbols(self, symbols: list[str], book_symbols: list[str], trade_symbols: list[str]) -> None:
         self.symbols = list(symbols)
@@ -133,6 +140,21 @@ class HydraEngine:
 
     def capital(self) -> float:
         return self.trader.capital_now() if self.trader.pos else self.trader.cash
+
+    def flat_ingest_health(self) -> str:
+        """Short feed-health line for periodic status when flat (approximate counts)."""
+        cfg = self.cfg
+        syms = self.market.trade_symbols
+        n_syms = len(syms)
+        n_fresh = sum(1 for s in syms if self.market.book_is_fresh(s))
+        ntape = sum(1 for s in syms if len(self.market.tape[s]) >= cfg.micro_min_trades)
+        auto = self.auto_stats.snapshot(self.capital())
+        missed = auto.get("missed", 0)
+        return (
+            f"L2fresh {n_fresh}/{n_syms} (≤{cfg.book_stale_sec:.0f}s) "
+            f"tape≥m {ntape} "
+            f"sig_miss={missed}"
+        )
 
     def process_message(self, m: dict[str, Any], live_gate: bool = True) -> None:
         if live_gate and self.run_control.live_paused.is_set():
@@ -172,14 +194,35 @@ class HydraEngine:
         elif channel == "trade" and m.get("type") == "update":
             for tr in data:
                 sym = tr.get("symbol")
-                if not sym or not self.market.symbol_live.get(sym):
+                # Do not gate tape on OHLC: after WS reconnect OHLC snapshots can lag trade
+                # updates, which would leave tape empty and block all micro/ignition signals.
+                if not sym:
+                    if self.verbose and "drop:nosymbol" not in self._tape_drop_logged:
+                        self._tape_drop_logged.add("drop:nosymbol")
+                        print("[TAPE] dropped trade batch item: missing symbol")
+                    continue
+                if sym not in self.market.trade_symbols:
+                    key = f"drop:unsub:{sym}"
+                    if self.verbose and key not in self._tape_drop_logged:
+                        self._tape_drop_logged.add(key)
+                        print(f"[TAPE] dropped trade: {sym!r} not in trade_symbols (subscription mismatch?)")
                     continue
                 price = sf(tr.get("price"))
                 qty = sf(tr.get("qty"))
                 side = tr.get("side")
                 if price <= 0 or qty <= 0 or side not in ("buy", "sell"):
+                    key = f"drop:badfield:{sym}"
+                    if self.verbose and key not in self._tape_drop_logged:
+                        self._tape_drop_logged.add(key)
+                        print(
+                            f"[TAPE] dropped trade {sym}: invalid price/qty/side "
+                            f"(price={tr.get('price')!r} qty={tr.get('qty')!r} side={side!r})"
+                        )
                     continue
                 self.market.add_trade_to_tape(sym, side, price, qty)
+                if self.verbose and sym not in self._tape_first_trade_logged:
+                    self._tape_first_trade_logged.add(sym)
+                    print(f"[TAPE] first ingest this session {sym} @ {price:.8g} {side}")
                 self.trader.on_tick(sym, price)
                 self.trader.maybe_micro_candidate(sym)
             self.trader.execute_due()
@@ -224,41 +267,94 @@ class HydraEngine:
             for regime, trs in sorted(by_regime.items()):
                 rpnl = sum(x["pnl_usd"] for x in trs)
                 rw = sum(1 for x in trs if x["pnl_usd"] > 0)
-                avg_hold = sum(float(x.get("hold_sec", 0.0) or 0.0) for x in trs) / max(len(trs), 1) / 60.0
-                avg_vel = sum(float(x.get("return_velocity_pct_per_min", 0.0) or 0.0) for x in trs) / max(len(trs), 1)
+                avg_hold = sum(float(x.get("hold_sec") or 0.0) for x in trs) / max(len(trs), 1) / 60.0
+                avg_vel = sum(float(x.get("return_velocity_pct_per_min") or 0.0) for x in trs) / max(len(trs), 1)
                 print(f"   {regime}: {len(trs)} trades, {rw} wins, pnl=${rpnl:+.4f}, avg_hold={avg_hold:.1f}m, vel={avg_vel:+.3f}%/m")
             m = self.metrics()
+            rph = float(m.get("return_per_hour") or 0.0)
+            eph = float(m.get("return_per_exposure_hour") or 0.0)
+            ahs = float(m.get("avg_hold_sec") or 0.0)
+            hs = float(m.get("horizon_score") or 0.0)
             print(
-                f"   velocity: session={m['return_per_hour']*100:+.2f}%/h  "
-                f"exposure={m['return_per_exposure_hour']*100:+.2f}%/h  "
-                f"avg_hold={m['avg_hold_sec']/60.0:.1f}m  horizon_score={m['horizon_score']:+.2f}"
+                f"   velocity: session={rph*100:+.2f}%/h  "
+                f"exposure={eph*100:+.2f}%/h  "
+                f"avg_hold={ahs/60.0:.1f}m  horizon_score={hs:+.2f}"
             )
             print(f"   log: {self.trader.csv_path}")
         print("=" * 64 + "\n")
 
     def dashboard_snapshot(self, focus: str | None = None, mode: str = "LIVE", optuna: dict | None = None, backtest: dict | None = None, params_source: str = "defaults") -> dict[str, Any]:
-        focus_sym = self.market.focus_candidate(focus, self.trader.pos["pair"] if self.trader.pos else None)
-        view = self.market.dashboard_view(focus_sym)
+        from .constants import FORCE_SYMBOLS
+        from .readiness import symbol_readiness_score
+
+        position_pair = self.trader.pos["pair"] if self.trader.pos else None
+        focus_sym = self.market.focus_candidate(focus, position_pair)
+
+        chart_symbols: list[str] = []
+        seen: set[str] = set()
+        for s in FORCE_SYMBOLS:
+            if s not in seen:
+                chart_symbols.append(s)
+                seen.add(s)
+        for s in self.trader.watch.keys():
+            if s not in seen:
+                chart_symbols.append(s)
+                seen.add(s)
+        if position_pair and position_pair not in seen:
+            chart_symbols.append(position_pair)
+            seen.add(position_pair)
+
+        view = self.market.dashboard_view(focus_sym, symbols=chart_symbols)
         auto = self.auto_stats.snapshot(self.capital())
-        return {
+
+        pump_events = tuple(
+            {
+                "symbol": s,
+                "at": float(w.get("at", 0.0)),
+                "spike_pct": float(w.get("spike_pct", 0.0)),
+                "burst_x": float(w.get("burst_x", 0.0)),
+                "anchor": float(w.get("anchor", 0.0)),
+            }
+            for s, w in self.trader.watch.items()
+        )
+
+        equity = self.capital()
+        start_cap = self.cfg.start_capital
+        strategies = (
+            {
+                "name": "Hydra (live)",
+                "equity": float(equity),
+                "start_capital": float(start_cap),
+                "net_return_pct": (float(equity) / start_cap - 1.0) * 100.0 if start_cap else 0.0,
+                "trades": len(self.trader.trades),
+                "active": True,
+            },
+        )
+
+        snap = {
             "mode": mode,
             "params_source": params_source,
             "market": view,
             "focus": focus_sym,
+            "chart_symbols": tuple(chart_symbols),
             "cash": self.trader.cash,
-            "equity": self.capital(),
+            "equity": equity,
             "position": dict(self.trader.pos) if self.trader.pos else None,
             "trades": tuple(self.trader.trades),
             "watch": tuple((s, dict(w)) for s, w in self.trader.watch.items()),
+            "pump_events": pump_events,
             "candidates": tuple(dict(c) for c in self.trader.candidates.values()),
             "btc_ok": self.market.btc_context_ok(False),
             "btc_strict": self.market.btc_context_ok(True),
             "btc_flush": self.market.btc_flush_active(),
             "auto": auto,
             "performance": self.trader.performance_snapshot(self.n_messages),
+            "strategies": strategies,
             "optuna": optuna or {},
             "backtest": backtest or {},
         }
+        snap["readiness"] = {sym: symbol_readiness_score(sym, snap) for sym in chart_symbols}
+        return snap
 
 
 async def subscribe_in_chunks(ws, channel: str, symbols: list[str], chunk: int = 50, extra: dict | None = None) -> None:
@@ -276,6 +372,9 @@ async def ws_session(engine: HydraEngine, recorder=None) -> None:
     async with websockets.connect(WS, ping_interval=20, max_size=2 ** 23) as ws:
         for s in engine.symbols:
             engine.market.symbol_live[s] = False
+        engine._reset_tape_ingest_logging()
+        if engine.verbose:
+            print("[WS] socket open: cleared per-session tape ingest log (first trade per pair prints once)")
         await subscribe_in_chunks(ws, "ohlc", engine.symbols, chunk=50, extra={"interval": 1, "snapshot": True})
         await subscribe_in_chunks(ws, "trade", engine.trade_symbols, chunk=50, extra={"snapshot": False})
         await subscribe_in_chunks(ws, "book", engine.book_symbols, chunk=50, extra={"depth": 10, "snapshot": True})
@@ -313,7 +412,13 @@ async def status_loop(engine: HydraEngine) -> None:
             book_txt = f" | sp {sp:.1f}bps book {imb:.2f}" if sp is not None and imb is not None else ""
             print(f"  [{t}] ${cap:.4f} | {p['pair']} [{p['regime']}] | net {net*100:+.2f}% | Trail {'ON' if p['trail_active'] else 'OFF'} | Hold {age}s | Watch {len(engine.trader.watch)} | Cand {len(engine.trader.candidates)}{book_txt}")
         else:
-            print(f"  [{t}] ${engine.trader.cash:.4f} | FLAT | Trades {len(engine.trader.trades)} | Watch {len(engine.trader.watch)} | Cand {len(engine.trader.candidates)}")
+            line = (
+                f"  [{t}] ${engine.trader.cash:.4f} | FLAT | Trades {len(engine.trader.trades)} "
+                f"| Watch {len(engine.trader.watch)} | Cand {len(engine.trader.candidates)}"
+            )
+            if engine.verbose:
+                line += f" | {engine.flat_ingest_health()}"
+            print(line)
 
 
 async def capital_tracker(engine: HydraEngine) -> None:
@@ -418,6 +523,4 @@ def build_live_engine(cfg: Config, params_source: str, record_or_replay_paths: l
     print(f"Book/trade symbols: {', '.join(engine.trade_symbols[:40])}{'...' if len(engine.trade_symbols) > 40 else ''}")
     print(f"Params: {params_source}\n")
     return engine
-
-
 

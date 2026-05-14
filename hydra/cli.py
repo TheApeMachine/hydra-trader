@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .backtest import run_historical_backtest, run_replay_backtest
 from .config import maybe_load_config
+from .dash_ws import start_dash_ws, DEFAULT_PORT as DASH_WS_DEFAULT_PORT
 from .dashboard import Dashboard
 from .engine import build_live_engine, start_capital_tracker_thread, start_replay_thread, start_ws_thread
 from .optimizer import AutoOptunaWatcher, OPTUNA_AVAILABLE, OptunaController
@@ -53,9 +54,21 @@ def parse_args(argv=None):
     p.add_argument("--hist-hours", type=int, default=12, help="Hours for --historical-backtest (Kraken OHLC is limited to recent candles).")
     p.add_argument("--hist-interval", type=int, default=1, help="Kraken OHLC interval in minutes for --historical-backtest.")
     p.add_argument("--no-dashboard", action="store_true", help="Run live/replay without opening the dashboard window.")
+    p.add_argument("--dash-ws", action="store_true", help="Broadcast dashboard snapshots over WebSocket for the SciChart browser dashboard.")
+    p.add_argument("--dash-ws-port", type=int, default=DASH_WS_DEFAULT_PORT, help="Port for --dash-ws (default 8765).")
+    p.add_argument("--dash-ws-interval", type=float, default=0.2, help="Seconds between WS broadcasts (default 0.2 = 5 Hz).")
     p.add_argument("--params", metavar="PATH", help="Load tuned params from JSON. Default: auto-load ./hydra_best.json if it exists.")
     p.add_argument("--no-params", action="store_true", help="Ignore saved tuned params; use Config defaults.")
-
+    p.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="Force adaptive gates on (default on; overridden by tuned JSON unless --no-adaptive).",
+    )
+    p.add_argument(
+        "--no-adaptive",
+        action="store_true",
+        help="Disable adaptive gates (overrides tuned JSON).",
+    )
     p.add_argument("--optuna", action="store_true", help="Run Optuna headlessly and exit.")
     p.add_argument("--optuna-recordings", default="", help="Comma-separated closed recording paths for Optuna.")
     p.add_argument("--optuna-trials", type=int, default=100, help="Trials for manual/headless Optuna.")
@@ -78,6 +91,10 @@ def _parse_recordings(s: str) -> list[str]:
 def main(argv=None):
     args = parse_args(argv)
     cfg, params_source = maybe_load_config(args.params, no_params=args.no_params)
+    if args.no_adaptive:
+        cfg.adaptive_enabled = False
+    elif args.adaptive:
+        cfg.adaptive_enabled = True
 
     if args.historical_backtest:
         symbols = _parse_recordings(args.hist_symbols)
@@ -93,7 +110,10 @@ def main(argv=None):
             "return_per_exposure_hour", "avg_hold_sec", "median_hold_sec",
             "avg_return_velocity_pct_per_min", "horizon_score",
         ):
-            print(f"  {k}: {metrics[k]}")
+            if k in metrics:
+                print(f"  {k}: {metrics[k]}")
+            else:
+                print(f"  {k}: (missing)")
         return
 
     optuna_controller = OptunaController(cfg)
@@ -124,6 +144,12 @@ def main(argv=None):
         optuna_controller = OptunaController(cfg, active_record_path_getter=lambda: engine.run_control.active_record_path)
         start_replay_thread(engine, args.replay, args.speed)
         start_capital_tracker_thread(engine)
+        if args.dash_ws:
+            start_dash_ws(
+                engine, cfg, params_source=params_source,
+                optuna_controller=optuna_controller,
+                port=args.dash_ws_port, interval=args.dash_ws_interval,
+            )
         if args.no_dashboard:
             try:
                 while True:
@@ -168,6 +194,13 @@ def main(argv=None):
             auto_watcher.start()
     start_ws_thread(engine, record_path=args.record)
 
+    if args.dash_ws:
+        start_dash_ws(
+            engine, cfg, params_source=params_source,
+            optuna_controller=optuna_controller,
+            port=args.dash_ws_port, interval=args.dash_ws_interval,
+        )
+
     if args.no_dashboard:
         try:
             while True:
@@ -187,6 +220,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
-
-
 

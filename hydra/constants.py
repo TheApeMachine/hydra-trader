@@ -4,7 +4,8 @@ WS = "wss://ws.kraken.com/v2"
 TOP_N = 300
 BOOK_N = 30
 BOOK_DEPTH = 10
-BOOK_STALE_SEC = 3.0
+# Fallback only; live checks use ``Config.book_stale_sec``.
+BOOK_STALE_SEC = 15.0
 
 FALLBACK_SYMBOLS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
@@ -20,6 +21,3 @@ DASH_PRICE_LEN = 600
 DASH_TAPE_LEN = 600
 DASH_FLOW_LEN = 480
 DASH_PERF_LEN = 1200
-
-
-
